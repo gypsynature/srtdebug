@@ -639,8 +639,8 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     <p>The <strong>Health thresholds</strong> card on the Decode stream tab sets the levels for warnings and failures.
       Changes apply to the next monitor you start. Each report lists the thresholds it used.</p>
     <h3>Without this panel</h3>
-    <p>The same monitor runs from a terminal, for example <code>python3 srtdebug.py monitor --mode listener --port 9000</code>.
-      Run <code>python3 srtdebug.py --help</code> for the options.</p>
+    <p>The same monitor runs from a terminal, for example <code>srtdebug monitor --mode listener --port 9000</code>.
+      Run <code>srtdebug --help</code> for the options.</p>
   </section>
 
 
