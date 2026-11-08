@@ -1,0 +1,42 @@
+srtdebug on a Mac: manual install
+=================================
+
+This is a manual install. It has not been tested on a Mac yet, so tell us if a step does not match what you see.
+You need an administrator account on the Mac.
+
+1. Install Homebrew (skip if you already have it)
+   Open Terminal (Applications > Utilities > Terminal) and paste the line from https://brew.sh
+   Press Return and follow the prompts. It can take several minutes.
+
+2. Install ffmpeg and the SRT tools
+   In Terminal, paste this line and press Return:
+
+       brew install ffmpeg srt
+
+   Check that the SRT tool is found:
+
+       which srt-live-transmit
+
+   If that prints nothing, tell us and we will give you the source-build steps.
+
+3. Get srtdebug
+   Unzip the srtdebug download and move the "srtdebug" folder somewhere you will keep it,
+   such as your Applications folder or Documents. Keep it in one place: the launchers
+   run from that folder.
+
+4. Start srtdebug
+   Open the "launcher" folder inside srtdebug and double-click "Launch srtdebug.command".
+   The first time, macOS may say it cannot be opened because it is from an unidentified
+   developer. Right-click the file, choose Open, and then Open again.
+   A Terminal window may flash up. Your browser then opens the srtdebug control panel.
+
+5. Stop srtdebug
+   Press the Quit button at the top of the control panel, or double-click
+   "Stop srtdebug.command" in the launcher folder.
+   Closing the browser tab also stops srtdebug after a few minutes, if no other window is open.
+
+Troubleshooting
+- If a double-click does nothing, right-click the file, choose Open, and try again.
+- If you see a message about Python, install the Command Line Tools when offered
+  (or run: xcode-select --install) and launch again.
+- The log is in ~/.srtdebug/panel.log. Send it with any problem report.
