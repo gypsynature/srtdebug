@@ -5,7 +5,6 @@ browser and watch the live dashboard on the same port. Each start runs a monitor
 background; the control panel proxies its dashboard, so only one port is opened.
 """
 
-import collections
 import html
 import http.server
 import json
@@ -22,9 +21,6 @@ import time
 import urllib.error
 from urllib.parse import parse_qs, quote, unquote
 import urllib.request
-import runhistory
-import history_web
-import customer_report
 
 import netlink
 import spikes
@@ -33,8 +29,6 @@ import thresholds
 import tsanalyze
 
 import srtdebug as core
-
-PROBE_RING_BYTES = 16 * 1024 * 1024   # the newest stream bytes kept for codec probing (about 6 s at 20 Mb/s)
 
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-:]{1,255}$")          # hostnames, IPv4 and IPv6 literals
 STREAMID_RE = re.compile(r"^[A-Za-z0-9._:/@\-]{0,128}$")   # conservative: no spaces or shell characters
@@ -95,7 +89,7 @@ def parse_config(d):
     if streamid and not STREAMID_RE.match(streamid):
         raise ValueError("streamid may only contain letters, digits and . _ : / @ -")
     return {"mode": mode, "port": port, "host": host or None, "latency": latency,
-            "streamid": streamid or None, "payload": d.get("payload", True) is not False, "view": bool(d.get("view")),
+            "streamid": streamid or None, "payload": bool(d.get("payload")), "view": bool(d.get("view")),
             "passphrase": passphrase or None, "pbkeylen": pbkeylen, "encrypted": bool(passphrase),
             "duration_min": duration_min}
 
@@ -122,7 +116,6 @@ class Session:
         self.timer = None                 # the scheduled stop, when a length was set
         self.ends_at = None
         self.auto_stopped = False
-        self.run = None                   # the saved run for this monitor (see runhistory)
 
     def make_pdf(self, html_path, pdf_path):
         """Runs in a thread: Chrome can take a while, so the browser is not left waiting on it."""
@@ -142,10 +135,7 @@ class Session:
     def start(self, cfg):
         with self.lock:
             self._stop_locked()
-            self.run = runhistory.RunRecorder(root=runhistory.DEFAULT_ROOT)
-            settings = {k: v for k, v in cfg.items() if k != "passphrase"}
-            settings["encrypted"] = bool(cfg.get("passphrase"))
-            self.dir = self.run.open_run("monitor", "monitor %s :%s" % (cfg["mode"], cfg["port"]), settings)
+            self.dir = tempfile.mkdtemp(prefix="srtdebug-serve-")
             with self.pdf_lock:
                 self.pdf = {"state": None, "error": ""}
             self.internal = free_port()
@@ -160,7 +150,7 @@ class Session:
             if cfg["streamid"]:
                 cmd += ["--streamid", cfg["streamid"]]
             if cfg["payload"]:
-                cmd += ["--payload", "--health", os.path.join(self.dir, "health.json")]
+                cmd.append("--payload")
             if cfg.get("view"):
                 cmd.append("--view")
             env = dict(os.environ)
@@ -198,19 +188,6 @@ class Session:
         if self.log_fh is not None:
             self.log_fh.close()
             self.log_fh = None
-        self._finish_run("scheduled length reached" if self.auto_stopped else "stopped by you")
-
-    def _finish_run(self, result):
-        """Close the saved run. Never lets a history problem stop the monitor."""
-        run, self.run = self.run, None
-        if run is None:
-            return
-        try:
-            run_dir = run.finish(result, report=self.health())
-            self.last_run_id = os.path.relpath(run_dir, runhistory.DEFAULT_ROOT).replace(os.sep, "/")
-            customer_report.write_html(run_dir)
-        except Exception:
-            pass
 
     def _scheduled_stop(self, proc):
         """The scheduled test has run its full length: stop it, then build the PDF for the download."""
@@ -240,29 +217,18 @@ class Session:
         except OSError:
             return []
 
-    def health(self):
-        """The stream report the monitor last wrote (refreshed every few seconds while it runs)."""
-        if not self.dir:
-            return None
-        return tsanalyze.read_report(os.path.join(self.dir, "health.json"))
-
     def status(self):
         running = self.running()
         code = self.proc.poll() if self.proc is not None else None
-        if not running and self.run is not None:
-            with self.lock:
-                self._finish_run("ended on its own (exit code %s)" % code)
         report = bool(self.dir) and os.path.exists(os.path.join(self.dir, "run.html"))
         csv = bool(self.dir) and os.path.exists(os.path.join(self.dir, "run.csv"))
         return {
-            "run_id": getattr(self, "last_run_id", None),
             "csv": csv,
             "running": running,
             "exit_code": None if running or code is None else code,
             "config": self.cfg,
             "uptime_s": int(time.time() - self.started) if running and self.started else 0,
             "has_session": self.proc is not None,
-            "health": self.health() if running else None,
             "report": report,
             "log": self.log_tail(),
             "ends_in_s": int(max(0, self.ends_at - time.time())) if running and self.ends_at else None,
@@ -298,28 +264,25 @@ CONTROL_PAGE = """<!doctype html>
 <html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>srtdebug control</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='5' fill='%230b1220'/><path d='M3 12h4l2-6 4 12 2-6h6' fill='none' stroke='%230a84ff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>">
 <style>
 :root {
-  --bg:#f2f3f6; --card:#ffffff; --soft:#f4f5f8; --ink:#111418; --muted:#5f6672; --line:#e4e6eb;
-  --field:#f7f8fa; --field-line:#c9ced8; --field-hover:#9aa2b1;
-  --accent:#0a84ff; --accent-soft:#e8f1fd; --accent-ink:#ffffff;
-  --accent-2:#ff453a; --accent-2-soft:#ffe9e7;
-  --ok:#17803d; --bad:#d92d20; --warn:#b54708;
-  --shadow:0 2px 10px rgba(16,24,40,.06);
+  --bg:#f4f6fa; --card:#ffffff; --soft:#eef1f7; --ink:#1a2233; --muted:#5f6b80; --line:#dde3ee;
+  --field:#f7f9fc; --field-line:#b9c4d6; --field-hover:#8f9db5;
+  --accent:#2563eb; --accent-soft:#e3ecfd; --accent-ink:#ffffff;
+  --accent-2:#ea5f0c; --accent-2-soft:#fdeadb;
+  --ok:#16a34a; --bad:#dc2626; --warn:#d97706;
 }
 :root[data-theme="dark"] {
-  --bg:#0b0d11; --card:#15181e; --soft:#1c2029; --ink:#f2f4f7; --muted:#9aa2b1; --line:#262b35;
-  --field:#0f1217; --field-line:#3a4150; --field-hover:#56617a;
-  --accent:#0a84ff; --accent-soft:#0f2a4a; --accent-ink:#ffffff;
-  --accent-2:#ff453a; --accent-2-soft:#3a1816;
-  --ok:#30d158; --bad:#ff453a; --warn:#ffb340;
-  --shadow:0 2px 12px rgba(0,0,0,.35);
+  --bg:#0b0f15; --card:#131923; --soft:#1a2230; --ink:#e7ecf4; --muted:#8793a8; --line:#263044;
+  --field:#0a0e14; --field-line:#3a4863; --field-hover:#56658a;
+  --accent:#3b8cff; --accent-soft:#16294a; --accent-ink:#ffffff;
+  --accent-2:#ff8a2a; --accent-2-soft:#3a2615;
+  --ok:#34d399; --bad:#f87171; --warn:#fbbf24;
 }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--ink);
        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
-.top { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--card) 88%, transparent); backdrop-filter: saturate(1.6) blur(12px); -webkit-backdrop-filter: saturate(1.6) blur(12px); border-bottom: 1px solid var(--line); }
+.top { position: sticky; top: 0; z-index: 5; background: var(--card); border-bottom: 1px solid var(--line); }
 .top-in { max-width: 1120px; margin: 0 auto; padding: 0 20px; height: 56px; display: flex; align-items: center; gap: 14px; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; }
 .brand svg { width: 22px; height: 22px; }
@@ -330,7 +293,7 @@ h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -.01em; }
 .sub { color: var(--muted); margin: 0 0 22px; }
 .layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; }
 @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 22px 24px; box-shadow: var(--shadow); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; }
 .kicker { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
 .card h2 { font-size: 15px; margin: 0 0 14px; font-weight: 650; }
 .group { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
@@ -392,7 +355,7 @@ input::placeholder { color: var(--muted); opacity: .8; }
 .tabs button { background: none; border: 0; padding: 10px 14px; margin-bottom: -1px; font: inherit; font-weight: 600;
                color: var(--muted); border-bottom: 2px solid transparent; cursor: pointer; }
 .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
-.btn { display: inline-flex; align-items: center; gap: 6px; padding: 10px 18px; border-radius: 12px; border: 1px solid var(--line);
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border-radius: 9px; border: 1px solid var(--line);
        background: var(--soft); color: var(--ink); font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; transition: transform .05s, opacity .15s; }
 .btn:hover { border-color: var(--accent); }
 .btn:active { transform: translateY(1px); }
@@ -443,7 +406,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 [hidden] { display: none !important; }
 
 /* sub-tabs inside Decode stream */
-.subtabs { display: inline-flex; gap: 4px; background: var(--soft); border: 1px solid var(--line); border-radius: 14px;
+.subtabs { display: inline-flex; gap: 4px; background: var(--soft); border: 1px solid var(--line); border-radius: 11px;
            padding: 4px; margin: 0 0 14px; }
 .subtabs button { border: 0; background: none; padding: 7px 14px; border-radius: 8px; font: inherit; font-weight: 600;
                   color: var(--muted); cursor: pointer; }
@@ -512,9 +475,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 @media (max-width: 800px) { .feed-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .feed-log-title { font-weight: 700; font-size: 13px; }
 .steps { margin: 4px 0 16px; }
-.steps-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.steps-row .steps { margin: 4px 0 16px; }
-.step-next-top { margin-left: auto; }
 .steps button { white-space: nowrap; }
 .step-nav { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 18px;
             padding-top: 14px; border-top: 1px solid var(--line); }
@@ -606,9 +566,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 .advanced summary { color: var(--ink); }
 .advanced[open] { padding-bottom: 12px; }
 .dest-main input { font-size: 16px; padding: 10px 12px; }
-#mon-health, #feed-health { white-space: pre-line; font-size: 13px; }
-.dest-details { margin-top: 18px; border-top: 1px solid var(--line, #e4e6eb); padding-top: 12px; }
-.dest-details summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
 .cmdbox { white-space: pre-wrap; word-break: break-all; background: var(--soft); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 12px; margin: 8px 0; }
 </style></head>
 <body>
@@ -625,7 +582,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
   <button class="btn primary" type="submit" form="cfg" id="start">Start monitoring</button>
   <button class="btn" id="help-btn" type="button" aria-label="How this tool works" aria-expanded="false" aria-controls="pane-help">?</button>
   <button class="btn" id="theme" type="button" aria-label="Toggle light and dark theme">Theme</button>
-  <a class="btn" href="/history" title="Saved runs, with graphs, search, export and delete">History</a>
   <button class="btn" id="quit" type="button" title="Stop srtdebug. It also stops by itself a few minutes after this window is closed.">Quit</button>
 </div></header>
 
@@ -715,7 +671,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     <div class="card status" aria-live="polite">
       <div class="status-top">
         <div class="state-row"><span class="led" id="dot"></span>
-          <div><div class="state" id="state">Checking...</div><div class="muted" id="detail"></div><div class="muted" id="mon-health"></div></div></div>
+          <div><div class="state" id="state">Checking...</div><div class="muted" id="detail"></div></div></div>
         <div class="actions">
           <button class="btn" id="view" type="button">Open live dashboard</button>
           <a class="btn" id="report" href="/report?download=1" download="srtdebug-report.html" hidden>HTML report</a>
@@ -798,10 +754,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
         </div>
       </div>
       <div class="foot">
-        <span class="muted">Press <strong>Start monitoring</strong> to begin. It changes to Stop while running.</span>
-        <div class="actions tight">
-          <button class="btn primary" id="start-foot" type="submit" form="cfg">Start monitoring</button>
-        </div>
+        <span class="muted">Press <strong>Start monitoring</strong> at the top to begin. It changes to Stop while running.</span>
         <div class="err" id="err" role="alert"></div>
       </div>
     </form>
@@ -831,12 +784,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
           <div class="feed-phase" id="feed-phase">Not sending</div>
           <p class="feed-detail" id="feed-status" aria-live="polite">Set where the feed goes below, then press Start feed.</p>
           <p class="feed-detail" id="feed-stats"></p>
-          <p class="feed-detail" id="feed-health"></p>
-  <div id="live-box" hidden>
-    <p class="feed-detail" id="live-head"></p>
-    <svg id="live-chart" viewBox="0 0 800 160" preserveAspectRatio="xMidYMid meet" style="width:100%;height:160px;display:block"></svg>
-    <p class="feed-detail"><span style="color:#1d6fb8">&#9632; round trip (ms)</span> &nbsp; <span style="color:#b42318">&#9632; dropped packets (running total)</span> &nbsp; <span>Saved to the History page when the feed stops.</span></p>
-  </div>
           <p class="feed-detail" id="feed-peer" hidden></p>
           <p class="feed-detail" id="feed-wifi" hidden></p>
           <div class="feed-alerts" id="feed-alerts" role="alert" hidden></div>
@@ -847,33 +794,12 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
           <p class="feed-detail" id="feed-counts"></p>
           <ol class="feed-events-list" id="feed-events"></ol>
         </div>
-        <div class="steps-row">
         <div class="subtabs steps" role="tablist" aria-label="Encode stream steps">
           <button type="button" role="tab" id="step-btn-1" data-go="1" aria-selected="true" aria-controls="feedcard">1 Where it goes</button>
           <button type="button" role="tab" id="step-btn-2" data-go="2" aria-selected="false" aria-controls="feedcard">2 Send</button>
         </div>
-        <button class="btn primary step-next-top" type="button" data-go="2">Next: Send &rarr;</button>
-        </div>
         <div class="feed-step" data-step="1">
         <div class="fields">
-          <div class="field full req dest-main"><label for="feed-host">Where it goes: address</label>
-            <input id="feed-host" placeholder="203.0.113.5" autocomplete="off">
-            <div class="hint">The IP address or name of the receiving monitor or media server.</div></div>
-          <div class="field req dest-main"><label for="feed-port">Port</label>
-            <input id="feed-port" type="number" min="1" max="65535" value="9100"></div>
-          <div class="field full"><label for="feed-url">Full address instead of host and port (optional)</label>
-            <input id="feed-url" placeholder="srt://203.0.113.5:9000?streamid=live/cam1">
-            <div class="hint" id="feed-url-msg">Leave empty to use the host and port above.</div></div>
-          <div class="field"><label for="feed-streamid">Stream ID (if the receiver needs one)</label>
-            <input id="feed-streamid" placeholder="live/cam1"></div>
-          <div class="field"><label for="feed-passphrase">Passphrase (if the receiver needs one)</label>
-            <input id="feed-passphrase" type="password" autocomplete="off" maxlength="80">
-            <div class="hint">10-80 characters. Not stored.</div></div>
-        </div>
-        <div class="step-nav"><span></span><button class="btn primary" type="button" data-go="2">Next: Send &rarr;</button></div>
-        <details class="dest-details">
-          <summary>Saved destinations <span class="muted small">(optional: choose one, or save this address for next time)</span></summary>
-          <div class="fields">
           <div class="field full dest-box">
             <div class="dest-head">Saved destinations <span class="muted small">(name, address and options; not the passphrase)</span></div>
             <div class="dest-save">
@@ -888,8 +814,21 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
             </div>
             <div class="hint" id="dest-msg">Fill in the destination, then press Save to keep it for next time.</div>
           </div>
-          </div>
-        </details>
+          <div class="field full req dest-main"><label for="feed-host">Where it goes: address</label>
+            <input id="feed-host" placeholder="203.0.113.5" autocomplete="off">
+            <div class="hint">The IP address or name of the receiving monitor or media server.</div></div>
+          <div class="field req dest-main"><label for="feed-port">Port</label>
+            <input id="feed-port" type="number" min="1" max="65535" value="9100"></div>
+          <div class="field full"><label for="feed-url">Full address instead of host and port (optional)</label>
+            <input id="feed-url" placeholder="srt://203.0.113.5:9000?streamid=live/cam1">
+            <div class="hint" id="feed-url-msg">Leave empty to use the host and port above.</div></div>
+          <div class="field"><label for="feed-streamid">Stream ID (if the receiver needs one)</label>
+            <input id="feed-streamid" placeholder="live/cam1"></div>
+          <div class="field"><label for="feed-passphrase">Passphrase (if the receiver needs one)</label>
+            <input id="feed-passphrase" type="password" autocomplete="off" maxlength="80">
+            <div class="hint">10-80 characters. Not stored.</div></div>
+        </div>
+        <div class="step-nav"><span></span><button class="btn primary" type="button" data-go="2">Next</button></div>
         </div>
         <div class="feed-step" data-step="2" hidden>
         <div class="dest-summary" id="dest-summary" role="status"></div>
@@ -1010,10 +949,9 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       <h2 id="feed-done-title">Encode stopped</h2>
       <button type="button" class="btn sm" id="feed-done-close">Close (Esc)</button>
     </div>
-    <p class="muted">Download the report of this feed: what was sent, the results, the diagrams and the assumptions.
-      It is also kept with this run in History. Close to go back to the start.</p>
+    <p class="muted">Download the log of this feed if you need it, or close to go back to the start.</p>
     <div class="done-actions">
-      <a class="btn primary" id="feed-done-report" href="#" hidden>Download report (PDF)</a>
+      <a class="btn primary" id="feed-done-log" href="/feed/log" download="srtdebug-feed.log">Feed log (text)</a>
     </div>
   </div>
 </div>
@@ -1025,7 +963,10 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     </div>
     <p class="muted" id="done-status">Preparing your reports…</p>
     <div class="done-actions">
-      <a class="btn primary" id="done-report" href="#" hidden>Download report (PDF)</a>
+      <a class="btn primary" id="done-zip" href="/reports.zip" hidden>All reports (zip)</a>
+      <a class="btn" id="done-html" href="/report?download=1" download="srtdebug-report.html" hidden>HTML report</a>
+      <a class="btn" id="done-pdf" href="/report.pdf" hidden>PDF report</a>
+      <a class="btn" id="done-csv" href="/report.csv" download hidden>CSV samples</a>
     </div>
   </div>
 </div>
@@ -1040,7 +981,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     var b = $('start'), feed = window.paneMode === 'feed';
     // the start screen has its own two buttons, so the header button is not shown there
     b.hidden = window.paneMode === 'home';
-    var foot = $('start-foot');
     if (window.paneMode === 'home') { return; }
     if (feed) {
       var fr = !!window.feedRunning;
@@ -1051,10 +991,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       b.type = 'submit'; b.setAttribute('form', 'cfg');
       b.textContent = window.srtRunning ? 'Stop monitoring' : 'Start monitoring';
       b.classList.toggle('danger', !!window.srtRunning);
-      if (foot) {
-        foot.textContent = b.textContent;
-        foot.classList.toggle('danger', !!window.srtRunning);
-      }
     }
   }
   window.syncTop = syncTop;
@@ -1206,7 +1142,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 
   function render(s) {
     var on = s.running;
-    $('mon-health').textContent = on ? window.healthText(s.health) : '';
     if (!window.monSeen) { window.monSeen = true; if (on) { showPane('control'); } }
     // a launch while this window is open asks it to come forward
     if (window.focusSeen === undefined) { window.focusSeen = s.focus_request; }
@@ -1256,7 +1191,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     window.srtRunning = on;
     syncTop();
     // a run that has just ended: offer the reports once (not on page load)
-    if (!on && window.wasOn && s.run_id) { openDone(s.run_id); }
+    if (!on && window.wasOn) { openDone(); }
     window.wasOn = on;
     if (!$('done-layer').hidden) { doneRender(s); }
     $('report').hidden = !s.report;
@@ -1268,36 +1203,23 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
   }
 
   function doneRender(s) {
-    var ready = !!(s.run_id || window.doneRunId);
+    var ready = !!s.report;
     $('done-title').textContent = s.auto_stopped ? 'Scheduled test complete' : 'Monitoring stopped';
     var waited = Date.now() - (window.doneSince || Date.now());
     if (ready) {
-      $('done-status').textContent = 'Your report is ready: what was streamed, the results, the diagrams and the '
-        + 'assumptions. It is also kept with this run in History. Press Esc to skip.';
+      $('done-status').textContent = 'Your reports are ready. Download them now, or press Esc to skip.';
+    } else if (!s.csv && waited > 8000) {
+      $('done-status').textContent = 'No data was received during this run, so there are no reports. '
+        + 'The log is in the status panel.';
     } else {
-      $('done-status').textContent = 'Preparing your report… Press Esc to skip.';
+      $('done-status').textContent = 'Preparing your reports… they will appear here. Press Esc to skip.';
     }
-    $('done-report').hidden = !ready;
+    $('done-zip').hidden = !ready;
+    $('done-html').hidden = !ready;
+    $('done-pdf').hidden = !ready;
+    $('done-csv').hidden = !s.csv;
   }
-  // the offer is made once per run: a run already offered does not reopen this dialog
-  function offeredOnce(rid) {
-    var key = 'srtdebug.reportOffered.' + rid;
-    try {
-      if (sessionStorage.getItem(key)) { return true; }
-      sessionStorage.setItem(key, '1');
-    } catch (err) { /* storage can be blocked: then the offer may show again, which is harmless */ }
-    return false;
-  }
-  function reportHref(rid) {
-    return '/history/customer?format=pdf&id=' + encodeURIComponent(rid);
-  }
-  window.offeredOnce = offeredOnce;
-  window.reportHref = reportHref;
-  function openDone(rid) {
-    if (offeredOnce(rid)) { return; }
-    window.doneRunId = rid;
-    $('done-report').href = reportHref(rid);
-    $('done-report').setAttribute('download', 'srtdebug-report.pdf');
+  function openDone() {
     window.doneSince = Date.now();
     window.reportsSaved = false;
     $('done-layer').hidden = false;
@@ -1327,13 +1249,9 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     var body = {mode: mode.value, port: $('port').value, host: $('host').value,
                 latency: $('latency').value, streamid: $('streamid').value, payload: $('payload').checked, view: $('vid').checked,
                 passphrase: $('passphrase').value, pbkeylen: $('pbkeylen').value, duration: $('duration').value};
-    var pre = window.softLimitGate().then(function (go) {
-      if (!go) { return 'blocked'; }
-      return mode.value === 'listener' ? fetchPreflight('listener')
-        : ($('host').value ? fetchPreflight('caller', $('host').value) : Promise.resolve(null));
-    });
+    var pre = mode.value === 'listener' ? fetchPreflight('listener')
+      : ($('host').value ? fetchPreflight('caller', $('host').value) : Promise.resolve(null));
     pre.then(function (rows) {
-      if (rows === 'blocked') { return; }
       return fetch('/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
         .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
         .then(function (x) {
@@ -1357,51 +1275,14 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     });
   });
   // while a monitor runs, the header button stops it instead of submitting the form
-  // at the soft limit of saved runs, ask before a new run starts. Runs are never blocked: OK starts it
-  // and it is still saved; Cancel opens History so runs can be moved, exported or deleted first.
-  window.softLimitGate = function () {
-    return fetch('/history/list').then(function (r) { return r.json(); }).then(function (d) {
-      var lim = d.limit || {};
-      if (lim.state !== 'limit') { return true; }
-      if (window.confirm(lim.message + '\\n\\nOK: start the run anyway. It will still be saved.\\n' +
-                         'Cancel: open History to move, export or delete runs first.')) { return true; }
-      window.location.href = '/history';
-      return false;
-    }).catch(function () { return true; });
-  };
-
-  // one line of stream health for the screens: the verdict, the check counts, and the codecs
-  window.healthText = function (h) {
-    if (!h) { return ''; }
-    var c = h.counts || {};
-    var streams = (h.streams || []).filter(function (x) { return x.details && x.details.length; });
-    function pick(st, label) {
-      if (!st) { return ''; }
-      var d = st.details.filter(function (p) { return p[0] === label; })[0];
-      return d ? d[1] : '';
-    }
-    var v = streams.filter(function (x) { return x.role.indexOf('Video') === 0; })[0];
-    var a = streams.filter(function (x) { return x.role.indexOf('Audio') === 0; })[0];
-    var out = 'Stream ' + String(h.overall || '').toUpperCase() + ': ' + (c['pass'] || 0) + ' pass, ' +
-      (c['warn'] || 0) + ' warn, ' + (c['fail'] || 0) + ' fail';
-    var vtxt = [pick(v, 'Codec'), pick(v, 'Resolution'), pick(v, 'Frame rate')].filter(Boolean).join(' · ');
-    var atxt = [pick(a, 'Codec'), pick(a, 'Channels'), pick(a, 'Sample rate')].filter(Boolean).join(' · ');
-    if (vtxt) { out += '\\nVideo: ' + vtxt; }
-    if (atxt) { out += '\\nAudio: ' + atxt; }
-    return out;
-  };
-
-  // the header button and the button under the form do the same job
-  function startClick(e) {
+  $('start').addEventListener('click', function (e) {
     if (window.paneMode === 'feed') {
       e.preventDefault();
       $(window.feedRunning ? 'feed-stop' : 'feed-start').click();
       return;
     }
     if (window.srtRunning) { e.preventDefault(); $('stop').click(); }
-  }
-  $('start').addEventListener('click', startClick);
-  $('start-foot').addEventListener('click', startClick);
+  });
 
   var thrSpec = [];
   function thrFill(values) {
@@ -1562,47 +1443,10 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
   }
   window.updateSendStrip = updateSendStrip;
   $('send-go').addEventListener('click', function () { if (window.showPane) { window.showPane('feed'); } });
-  function drawLive(series, running) {
-    var box = $('live-box'), svg = $('live-chart');
-    box.hidden = !running && !series.length;
-    if (box.hidden) return;
-    $('live-head').textContent = series.length
-      ? 'Live: the last ' + series.length + ' readings (about one a second), round trip and dropped packets.'
-      : 'The live graph starts once the feed connects.';
-    while (svg.firstChild) svg.removeChild(svg.firstChild);
-    if (!series.length) return;
-    var NS = 'http://www.w3.org/2000/svg', W = 800, H = 160, P = 26;
-    function el(name, attrs) { var e = document.createElementNS(NS, name); for (var k in attrs) e.setAttribute(k, attrs[k]); svg.appendChild(e); return e; }
-    function num(v) { return v === null || v === undefined || isNaN(v) ? null : Number(v); }
-    var rtts = series.map(function (p) { return num(p.rtt_ms); }).filter(function (v) { return v !== null; });
-    var drops = series.map(function (p) { return num(p.dropped); }).filter(function (v) { return v !== null; });
-    var maxR = Math.max(1, Math.max.apply(null, rtts.concat([0])));
-    var maxD = Math.max(1, Math.max.apply(null, drops.concat([0])));
-    function x(i) { return series.length === 1 ? P : P + i * (W - 2 * P) / (series.length - 1); }
-    function yR(v) { return H - P - v / maxR * (H - 2 * P); }
-    function yD(v) { return H - P - v / maxD * (H - 2 * P); }
-    function line(vals, y, color) {
-      var pts = [];
-      vals.forEach(function (v, i) { if (v !== null) pts.push(x(i).toFixed(1) + ',' + y(v).toFixed(1)); });
-      if (pts.length) el('polyline', { points: pts.join(' '), fill: 'none', stroke: color, 'stroke-width': 2 });
-    }
-    function label(text, lx, ly, anchor) {
-      var t = el('text', { x: lx, y: ly, 'font-size': 11, fill: 'currentColor', 'text-anchor': anchor });
-      t.textContent = text;
-    }
-    line(series.map(function (p) { return num(p.rtt_ms); }), yR, '#1d6fb8');
-    line(series.map(function (p) { return num(p.dropped); }), yD, '#b42318');
-    label(maxR.toFixed(1) + ' ms', 4, P - 6, 'start');
-    label('0', 4, H - P + 4, 'start');
-    label(maxD + ' dropped', W - 4, P + 14, 'end');
-    label(series[0].t, P, H - 6, 'start');
-    label(series[series.length - 1].t, W - P, H - 6, 'end');
-  }
-
   function render(s) {
     var feedNow = !!s.running;
     // the feed has just stopped (by the user or on its own): offer its log, then go back to the start screen
-    if (window.feedWasOn && !feedNow && s.run_id) { openFeedDone(s.run_id); }
+    if (window.feedWasOn && !feedNow) { openFeedDone(); }
     window.feedWasOn = feedNow;
     if (!window.feedSeen) { window.feedSeen = true; if (feedNow && window.showPane) { window.showPane('feed'); } }
     window.feedRunning = feedNow;
@@ -1670,8 +1514,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     var avms = stt && s.running ? stt.av_ms : null;
     $('feed-stats').textContent = avms == null ? '' : 'A/V offset on the way out: ' + (avms > 0 ? '+' : '') +
       Math.round(avms) + ' ms (' + (avms > 1 ? 'audio leads' : avms < -1 ? 'audio lags' : 'in step') + ')';
-    $('feed-health').textContent = window.healthText(s.health);
-    drawLive(s.live || [], s.running);
     var al = $('feed-alerts'), alerts = (stt && s.running && stt.alerts) || [];
     al.innerHTML = '';
     al.hidden = !alerts.length;
@@ -2018,9 +1860,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
   });
   // starts the feed. Above this computer's limit the user is asked first, and can still go ahead
   function startFeedRequest(body) {
-    window.softLimitGate().then(function (go) { if (go) { startFeedRequestNow(body); } });
-  }
-  function startFeedRequestNow(body) {
     fetch('/feed/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
       .then(function (r) { return r.json(); })
       .then(function (j) {
@@ -2048,12 +1887,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       render(j);
     });
   });
-  function openFeedDone(rid) {
-    if (window.offeredOnce(rid)) { return; }
-    var link = $('feed-done-report');
-    link.href = window.reportHref(rid);
-    link.setAttribute('download', 'srtdebug-report.pdf');
-    link.hidden = false;
+  function openFeedDone() {
     window.feedLogSaved = false;
     $('feed-done-layer').hidden = false;
     $('feed-done-close').focus({preventScroll: true});
@@ -2360,13 +2194,6 @@ def _handler(session):
                 snap = METER.snapshot()
                 snap["active"] = bool(_our_pids())   # the meter shows only while the feed or monitor runs
                 self._json(200, snap)
-            elif path.startswith("/history"):
-                hist = history_web.handle_get(path, urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query))
-                if hist is None:
-                    self._send(404, "<p>Not found.</p>")
-                else:
-                    code, ctype, body, fname = hist
-                    self._send(code, body, ctype, filename=fname or None)
             elif path == "/feed/log":
                 # the whole debug log of the last feed, as a text file
                 if not FEEDER.logpath or not os.path.exists(FEEDER.logpath):
@@ -2410,17 +2237,6 @@ def _handler(session):
                 self._json(200, {"ok": not err, "path": saved, "lines": lines, "error": err, "warn": warn})
                 return
             raw = self.rfile.read(min(length, 10000)) if length else b"{}"
-            if path.startswith("/history/"):
-                try:
-                    hbody = json.loads(raw.decode("utf-8") or "{}")
-                except ValueError:
-                    hbody = {}
-                res = history_web.handle_post(path, hbody if isinstance(hbody, dict) else {})
-                if res is None:
-                    self._send(404, "<p>Not found.</p>")
-                else:
-                    self._json(*res)
-                return
             if path == "/thresholds":
                 try:
                     body = json.loads(raw.decode("utf-8") or "{}")
@@ -2864,7 +2680,7 @@ def _plain_events(lines):
     return collapsed[-8:], connects, closes, totals
 
 
-def _forward(src, dst, analyser, keep=None):
+def _forward(src, dst, analyser):
     """Copies the transport stream from ffmpeg to srt-live-transmit and measures it on the way.
     The copy is written first, so measuring never delays the stream. If measuring fails, the copy carries on."""
     measuring = analyser is not None
@@ -2875,8 +2691,6 @@ def _forward(src, dst, analyser, keep=None):
                 break
             dst.write(chunk)
             dst.flush()
-            if keep is not None:
-                keep(chunk)
             if measuring:
                 try:
                     analyser.feed(chunk)
@@ -3049,7 +2863,7 @@ def feed_command_text(uri, path, loop, level, stats="<stats file>", encode=None)
     src += (["-stream_loop", "-1"] if loop else [])
     src += ["-i", path] + (encode or ["-c", "copy"]) + ["-f", "mpegts"] + FEED_MUX + ["-"]
     # -chunk:1316 sets the media payload per SRT packet: 1316 bytes, seven 188-byte transport-stream packets
-    dst = ["srt-live-transmit", "file://con", uri, "-chunk:1316", "-loglevel:" + level, "-stats-report-frequency:50",
+    dst = ["srt-live-transmit", "file://con", uri, "-chunk:1316", "-loglevel:" + level, "-stats-report-frequency:500",
            "-statsout:" + stats, "-pf:json"]
     return _redact(shlex.join(src) + " | " + shlex.join(dst))
 
@@ -3202,10 +3016,6 @@ class Feeder:
         self.host_port = ""
         self.encrypted = False
         self.statspath = ""
-        self.run = None                   # the saved run for this feed (see runhistory)
-        self.follower = None
-        self._run_stop = None
-        self._run_lock = threading.Lock()
         self._stats_off = 0
         self._stats_last = None
         self._stats_tot = {"bytes": 0, "packets": 0, "lost": 0, "retrans": 0, "dropped": 0, "recv": 0}
@@ -3412,14 +3222,7 @@ class Feeder:
             # the feed ended on its own (not stopped from the panel): say why, in the reader's words
             self.error = "The feed stopped." + (" Last message: " + prog["log_tail"][-1] if prog["log_tail"] else "")
             self.clip = self.target = ""
-            self._end_run("ended on its own")
-        report = None
-        if prog["running"] and self.ts is not None:
-            try:
-                report = tsanalyze.build_report(self.ts, fields=self.codec_fields)
-            except Exception:
-                report = None
-        return {"health": report, "run_id": getattr(self, "last_run_id", None), "running": prog["running"], "clip": self.clip, "target": self.target, "error": self.error,
+        return {"running": prog["running"], "clip": self.clip, "target": self.target, "error": self.error,
                 "notice": self.notice if self.want else "", "restarts": len(self.restarts),
                 "resume_at": _fmt_clock(self.resume_at) if self.resume_at else "", "rate_max": cpu_profile()[2], "rate_note": cpu_note(),
                 "make": dict(self.make), "samples_dir": self.samples_dir, "clips": clips(self.samples_dir),
@@ -3440,8 +3243,7 @@ class Feeder:
                 "wifi_forced": self.wifi_forced if prog["running"] else False,
                 "network_wifi": network_detected(),
                 "encode_label": self.encode_label if prog["running"] else "",
-                "gop": self._gop_text() if prog["running"] else "",
-                "live": self.follower.live() if self.follower is not None else []}
+                "gop": self._gop_text() if prog["running"] else ""}
 
     def start(self, body, keep_log=False, note=None, resuming=False):
         if not resuming:
@@ -3543,8 +3345,6 @@ class Feeder:
                 fd, self.logpath = tempfile.mkstemp(prefix="srtdebug-feed-", suffix=".log")
                 self.log = os.fdopen(fd, "w")
                 self.view_offset = 0
-            if not resuming:
-                self._begin_run(body, uri)
             sfd, self.statspath = tempfile.mkstemp(prefix="srtdebug-feed-stats-", suffix=".json")
             self._stats_off = 0
             self._stats_last = None
@@ -3558,15 +3358,11 @@ class Feeder:
                 self.p1 = subprocess.Popen(src, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 threading.Thread(target=_pump_lines, args=(self.p1.stderr, self.log, "ffmpeg: "), daemon=True).start()
                 self.ts = tsanalyze.TSAnalyzer(start=time.monotonic())
-                self._ring, self._ring_n, self.codec_fields = collections.deque(), 0, {}
-                if not hasattr(self, "_ring_lock"):
-                    self._ring_lock = threading.Lock()
                 self.p2 = subprocess.Popen([shutil_which("srt-live-transmit") or core.SRT_BIN, "file://con", uri,
-                                            "-chunk:1316", "-loglevel:" + level, "-stats-report-frequency:50",
+                                            "-chunk:1316", "-loglevel:" + level, "-stats-report-frequency:500",
                                             "-statsout:" + self.statspath, "-pf:json"],
                                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.log)
-                threading.Thread(target=_forward, args=(self.p1.stdout, self.p2.stdin, self.ts, self._keep_bytes),
-                                 daemon=True).start()
+                threading.Thread(target=_forward, args=(self.p1.stdout, self.p2.stdin, self.ts), daemon=True).start()
             except OSError as e:
                 self.error = f"Could not start the feed: {e}"
                 return False, self.error
@@ -3581,7 +3377,6 @@ class Feeder:
             if not resuming:
                 self.restarts = []
             threading.Thread(target=self._watch, args=(self.gen,), daemon=True).start()
-            threading.Thread(target=self._probe_feed, args=(self.gen,), daemon=True).start()
             if clock_file:
                 threading.Thread(target=_clock_writer, args=(clock_file, self.gen, self), daemon=True).start()
             self.host_port = uri.split("?")[0].replace("srt://", "")
@@ -3620,7 +3415,6 @@ class Feeder:
             self.notice = ""
             self._kill_procs()
             self.clip = self.target = ""
-            self._end_run("stopped by you")
 
     def _av_now(self):
         """Audio-video offset on the way out, in ms (positive: audio leads). Not shown yet: the measurement from
@@ -3633,75 +3427,6 @@ class Feeder:
             return None
         vals = [v for v in (self.ts._av_offset_ms(w) for w in wins) if v is not None]
         return round(statistics.median(vals), 1) if vals else None
-
-    def _begin_run(self, body, uri):
-        """Open a saved run for this feed, and keep its numbers in step with the sender's stats."""
-        self._end_run("replaced by a new feed")
-        settings = {k: v for k, v in body.items() if k != "passphrase"}
-        settings["encrypted"] = bool(body.get("passphrase"))
-        settings["host"] = uri.split("?")[0].replace("srt://", "")
-        rec = runhistory.RunRecorder(root=runhistory.DEFAULT_ROOT)
-        run_dir = rec.open_run("feed", "feed " + settings["host"], settings)
-        self.run = rec
-        self.follower = runhistory.TransmitFollower(run_dir)
-        self._run_stop = threading.Event()
-        stop = self._run_stop
-
-        def follow():
-            while not stop.wait(2):
-                self._poll_run()
-        threading.Thread(target=follow, daemon=True).start()
-
-    def _poll_run(self):
-        with self._run_lock:
-            if self.follower is not None and self.run is not None:
-                try:
-                    self.follower.poll(self.statspath, self.logpath)
-                except Exception:
-                    pass
-
-    def _end_run(self, result):
-        """Finish the saved run. Never lets a history problem stop the feed."""
-        with self._run_lock:
-            rec, follower, stop = self.run, self.follower, self._run_stop
-            self.run = self.follower = self._run_stop = None
-        if rec is None:
-            return
-        if stop is not None:
-            stop.set()
-        try:
-            if follower is not None:
-                follower.poll(self.statspath, self.logpath)
-                follower.close()
-            report = tsanalyze.build_report(self.ts, fields=self.codec_fields) if self.ts is not None else None
-            run_dir = rec.finish(result, report=report)
-            self.last_run_id = os.path.relpath(run_dir, runhistory.DEFAULT_ROOT).replace(os.sep, "/")
-            customer_report.write_html(run_dir)
-        except Exception:
-            pass
-
-    def _keep_bytes(self, chunk):
-        """The newest PROBE_RING_BYTES of the stream, for ffprobe to read the codecs from."""
-        with self._ring_lock:
-            self._ring.append(chunk)
-            self._ring_n += len(chunk)
-            while self._ring_n > PROBE_RING_BYTES and self._ring:
-                self._ring_n -= len(self._ring.popleft())
-
-    def _probe_feed(self, gen):
-        """Reads the codec of each stream from the bytes being sent, so a feed shows what it carries."""
-        time.sleep(6)
-        while self.gen == gen and self.running():
-            with self._ring_lock:
-                snap = b"".join(self._ring)
-            if len(snap) >= 188 * 200:
-                try:
-                    info = tsanalyze.probe_stream(snap)
-                except Exception:
-                    info = None
-                if info:
-                    self.codec_fields = {pid: tsanalyze.stream_fields(s) for pid, s in info.items()}
-            time.sleep(15)
 
     def _kill_procs(self):
         for p in (self.p2, self.p1):
