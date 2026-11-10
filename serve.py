@@ -5,6 +5,7 @@ browser and watch the live dashboard on the same port. Each start runs a monitor
 background; the control panel proxies its dashboard, so only one port is opened.
 """
 
+import collections
 import html
 import http.server
 import json
@@ -21,6 +22,9 @@ import time
 import urllib.error
 from urllib.parse import parse_qs, quote, unquote
 import urllib.request
+import runhistory
+import history_web
+import customer_report
 
 import netlink
 import spikes
@@ -29,6 +33,8 @@ import thresholds
 import tsanalyze
 
 import srtdebug as core
+
+PROBE_RING_BYTES = 16 * 1024 * 1024   # the newest stream bytes kept for codec probing (about 6 s at 20 Mb/s)
 
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-:]{1,255}$")          # hostnames, IPv4 and IPv6 literals
 STREAMID_RE = re.compile(r"^[A-Za-z0-9._:/@\-]{0,128}$")   # conservative: no spaces or shell characters
@@ -89,9 +95,9 @@ def parse_config(d):
     if streamid and not STREAMID_RE.match(streamid):
         raise ValueError("streamid may only contain letters, digits and . _ : / @ -")
     return {"mode": mode, "port": port, "host": host or None, "latency": latency,
-            "streamid": streamid or None, "payload": bool(d.get("payload")), "view": bool(d.get("view")),
+            "streamid": streamid or None, "payload": d.get("payload", True) is not False, "view": bool(d.get("view")),
             "passphrase": passphrase or None, "pbkeylen": pbkeylen, "encrypted": bool(passphrase),
-            "duration_min": duration_min}
+            "duration_min": duration_min, "preset": re.sub(r"[^\w .()+-]", "", str(d.get("preset") or ""))[:60].strip() or None}
 
 
 def free_port():
@@ -116,6 +122,7 @@ class Session:
         self.timer = None                 # the scheduled stop, when a length was set
         self.ends_at = None
         self.auto_stopped = False
+        self.run = None                   # the saved run for this monitor (see runhistory)
 
     def make_pdf(self, html_path, pdf_path):
         """Runs in a thread: Chrome can take a while, so the browser is not left waiting on it."""
@@ -135,7 +142,10 @@ class Session:
     def start(self, cfg):
         with self.lock:
             self._stop_locked()
-            self.dir = tempfile.mkdtemp(prefix="srtdebug-serve-")
+            self.run = runhistory.RunRecorder(root=runhistory.DEFAULT_ROOT)
+            settings = {k: v for k, v in cfg.items() if k != "passphrase"}
+            settings["encrypted"] = bool(cfg.get("passphrase"))
+            self.dir = self.run.open_run("monitor", "monitor %s :%s" % (cfg["mode"], cfg["port"]), settings)
             with self.pdf_lock:
                 self.pdf = {"state": None, "error": ""}
             self.internal = free_port()
@@ -150,7 +160,7 @@ class Session:
             if cfg["streamid"]:
                 cmd += ["--streamid", cfg["streamid"]]
             if cfg["payload"]:
-                cmd.append("--payload")
+                cmd += ["--payload", "--health", os.path.join(self.dir, "health.json")]
             if cfg.get("view"):
                 cmd.append("--view")
             env = dict(os.environ)
@@ -188,6 +198,19 @@ class Session:
         if self.log_fh is not None:
             self.log_fh.close()
             self.log_fh = None
+        self._finish_run("scheduled length reached" if self.auto_stopped else "stopped by you")
+
+    def _finish_run(self, result):
+        """Close the saved run. Never lets a history problem stop the monitor."""
+        run, self.run = self.run, None
+        if run is None:
+            return
+        try:
+            run_dir = run.finish(result, report=self.health())
+            self.last_run_id = os.path.relpath(run_dir, runhistory.DEFAULT_ROOT).replace(os.sep, "/")
+            customer_report.write_html(run_dir)
+        except Exception:
+            pass
 
     def _scheduled_stop(self, proc):
         """The scheduled test has run its full length: stop it, then build the PDF for the download."""
@@ -217,18 +240,29 @@ class Session:
         except OSError:
             return []
 
+    def health(self):
+        """The stream report the monitor last wrote (refreshed every few seconds while it runs)."""
+        if not self.dir:
+            return None
+        return tsanalyze.read_report(os.path.join(self.dir, "health.json"))
+
     def status(self):
         running = self.running()
         code = self.proc.poll() if self.proc is not None else None
+        if not running and self.run is not None:
+            with self.lock:
+                self._finish_run("ended on its own (exit code %s)" % code)
         report = bool(self.dir) and os.path.exists(os.path.join(self.dir, "run.html"))
         csv = bool(self.dir) and os.path.exists(os.path.join(self.dir, "run.csv"))
         return {
+            "run_id": getattr(self, "last_run_id", None),
             "csv": csv,
             "running": running,
             "exit_code": None if running or code is None else code,
             "config": self.cfg,
             "uptime_s": int(time.time() - self.started) if running and self.started else 0,
             "has_session": self.proc is not None,
+            "health": self.health() if running else None,
             "report": report,
             "log": self.log_tail(),
             "ends_in_s": int(max(0, self.ends_at - time.time())) if running and self.ends_at else None,
@@ -260,29 +294,36 @@ class Session:
             return r.read(), r.headers.get("Content-Type", "text/html; charset=utf-8")
 
 
+# Added to the live dashboard page when the control panel shows it: applies the panel's theme
+# (from ?theme= on load, and from messages after that) so the embed matches the panel.
+VIEW_INJECT = """<script>(function(){function set(t){if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}set(new URLSearchParams(location.search).get('theme'));window.addEventListener('message',function(e){if(e.data&&e.data.srtTheme){set(e.data.srtTheme);}});})();</script>"""
+
 CONTROL_PAGE = """<!doctype html>
 <html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>srtdebug control</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='5' fill='%230b1220'/><path d='M3 12h4l2-6 4 12 2-6h6' fill='none' stroke='%230a84ff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>">
 <style>
 :root {
-  --bg:#f4f6fa; --card:#ffffff; --soft:#eef1f7; --ink:#1a2233; --muted:#5f6b80; --line:#dde3ee;
-  --field:#f7f9fc; --field-line:#b9c4d6; --field-hover:#8f9db5;
-  --accent:#2563eb; --accent-soft:#e3ecfd; --accent-ink:#ffffff;
-  --accent-2:#ea5f0c; --accent-2-soft:#fdeadb;
-  --ok:#16a34a; --bad:#dc2626; --warn:#d97706;
+  --bg:#f2f3f6; --card:#ffffff; --soft:#f4f5f8; --ink:#111418; --muted:#5f6672; --line:#e4e6eb;
+  --field:#ffffff; --field-line:#8e97a8; --field-hover:#5f6672;
+  --accent:#0a84ff; --accent-soft:#e8f1fd; --accent-ink:#ffffff;
+  --accent-2:#ff453a; --accent-2-soft:#ffe9e7;
+  --ok:#17803d; --bad:#d92d20; --warn:#b54708;
+  --shadow:0 2px 10px rgba(16,24,40,.06);
 }
 :root[data-theme="dark"] {
-  --bg:#0b0f15; --card:#131923; --soft:#1a2230; --ink:#e7ecf4; --muted:#8793a8; --line:#263044;
-  --field:#0a0e14; --field-line:#3a4863; --field-hover:#56658a;
-  --accent:#3b8cff; --accent-soft:#16294a; --accent-ink:#ffffff;
-  --accent-2:#ff8a2a; --accent-2-soft:#3a2615;
-  --ok:#34d399; --bad:#f87171; --warn:#fbbf24;
+  --bg:#0b0d11; --card:#15181e; --soft:#1c2029; --ink:#f2f4f7; --muted:#9aa2b1; --line:#262b35;
+  --field:#0b0e13; --field-line:#4a5366; --field-hover:#6b7691;
+  --accent:#0a84ff; --accent-soft:#0f2a4a; --accent-ink:#ffffff;
+  --accent-2:#ff453a; --accent-2-soft:#3a1816;
+  --ok:#30d158; --bad:#ff453a; --warn:#ffb340;
+  --shadow:0 2px 12px rgba(0,0,0,.35);
 }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--ink);
        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
-.top { position: sticky; top: 0; z-index: 5; background: var(--card); border-bottom: 1px solid var(--line); }
+.top { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--card) 88%, transparent); backdrop-filter: saturate(1.6) blur(12px); -webkit-backdrop-filter: saturate(1.6) blur(12px); border-bottom: 1px solid var(--line); }
 .top-in { max-width: 1120px; margin: 0 auto; padding: 0 20px; height: 56px; display: flex; align-items: center; gap: 14px; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; }
 .brand svg { width: 22px; height: 22px; }
@@ -293,7 +334,7 @@ h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -.01em; }
 .sub { color: var(--muted); margin: 0 0 22px; }
 .layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; }
 @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 22px 24px; box-shadow: var(--shadow); }
 .kicker { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
 .card h2 { font-size: 15px; margin: 0 0 14px; font-weight: 650; }
 .group { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
@@ -301,11 +342,11 @@ h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -.01em; }
 .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 16px; }
 @media (max-width: 600px) { .fields { grid-template-columns: 1fr; } }
 .field.full { grid-column: 1 / -1; }
-label { display: block; font-size: 12.5px; color: var(--ink); font-weight: 600; margin-bottom: 6px; letter-spacing: .01em; }
+label { display: block; font-size: 13.5px; color: var(--ink); font-weight: 700; margin-bottom: 7px; letter-spacing: .01em; }
 /* fields are set apart from the cards: their own background, a firmer border, and a clear hover and focus */
-input, select { width: 100%; padding: 9px 11px; border: 1px solid var(--field-line); border-radius: 9px;
-                background-color: var(--field); color: var(--ink); font: inherit; outline: none;
-                box-shadow: inset 0 1px 2px rgba(15, 23, 42, .08); transition: border-color .15s, box-shadow .15s; }
+input, select { width: 100%; min-height: 42px; padding: 10px 13px; border: 1.5px solid var(--field-line); border-radius: 10px;
+                background-color: var(--field); color: var(--ink); font: inherit; font-size: 14px; outline: none;
+                box-shadow: inset 0 1px 3px rgba(15, 23, 42, .14); transition: border-color .15s, box-shadow .15s; }
 input:hover, select:hover { border-color: var(--field-hover); }
 input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 input:disabled, select:disabled { opacity: .55; cursor: not-allowed; }
@@ -316,7 +357,7 @@ input::placeholder { color: var(--muted); opacity: .8; }
 .check { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft); font-weight: 500; color: var(--ink); margin: 0; }
 .check input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
 .check span { font-size: 13.5px; }
-.hint { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+.hint { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 7px; padding-left: 10px; border-left: 2px solid var(--line); }
 .cpu-note { margin-top: 10px; padding: 10px 12px; border-radius: 9px; border: 1px solid var(--line); border-left: 3px solid var(--accent); background: var(--soft); color: var(--ink); font-size: 13px; line-height: 1.55; }
 .cpu-note[hidden] { display: none; }
 .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 18px; }
@@ -355,7 +396,7 @@ input::placeholder { color: var(--muted); opacity: .8; }
 .tabs button { background: none; border: 0; padding: 10px 14px; margin-bottom: -1px; font: inherit; font-weight: 600;
                color: var(--muted); border-bottom: 2px solid transparent; cursor: pointer; }
 .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
-.btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border-radius: 9px; border: 1px solid var(--line);
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 10px 18px; border-radius: 12px; border: 1px solid var(--line);
        background: var(--soft); color: var(--ink); font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; transition: transform .05s, opacity .15s; }
 .btn:hover { border-color: var(--accent); }
 .btn:active { transform: translateY(1px); }
@@ -406,7 +447,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 [hidden] { display: none !important; }
 
 /* sub-tabs inside Decode stream */
-.subtabs { display: inline-flex; gap: 4px; background: var(--soft); border: 1px solid var(--line); border-radius: 11px;
+.subtabs { display: inline-flex; gap: 4px; background: var(--soft); border: 1px solid var(--line); border-radius: 14px;
            padding: 4px; margin: 0 0 14px; }
 .subtabs button { border: 0; background: none; padding: 7px 14px; border-radius: 8px; font: inherit; font-weight: 600;
                   color: var(--muted); cursor: pointer; }
@@ -418,6 +459,9 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 .field.req.optional input { border-color: var(--line); box-shadow: none; }
 .field.req.optional.empty input { border-color: var(--line); box-shadow: none; }
 .field.invalid input { border-color: var(--bad); box-shadow: 0 0 0 3px rgba(220, 38, 38, .14); }
+/* a valid Decode port or host turns green, as a field filled from a saved destination does */
+.field.valid input { border-color: #17803d; background: rgba(23,128,61,.07); box-shadow: none; }
+.field.valid > label::after { content: "\\2713 ok"; margin-left: 8px; color: #17803d; font-size: 12px; font-weight: 700; }
 .hint.bad { color: var(--bad); } .hint.good { color: var(--ok); }
 .send-strip { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap;
               margin: 0 0 10px; padding: 10px 12px; border-radius: 10px; background: var(--card);
@@ -475,6 +519,10 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 @media (max-width: 800px) { .feed-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .feed-log-title { font-weight: 700; font-size: 13px; }
 .steps { margin: 4px 0 16px; }
+.steps-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.steps-row .steps { margin: 4px 0 16px; }
+.step-next-top { margin-left: auto; }
+.clip-make { margin-top: 8px; }
 .steps button { white-space: nowrap; }
 .step-nav { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 18px;
             padding-top: 14px; border-top: 1px solid var(--line); }
@@ -534,6 +582,33 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 .dlg .row { display: flex; gap: 8px; margin-top: 6px; }
 .dlg .row input { flex: 1; min-width: 0; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--soft); color: var(--ink); font: inherit; }
 .dlg .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.custom-dlg { width: min(520px, 100%); }
+#feed-state { scroll-margin-top: 90px; }
+.status { scroll-margin-top: 90px; }
+.vpn-banner { margin: 0 0 14px; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--warn); border-left: 6px solid var(--warn); background: var(--card); }
+.vpn-banner.fail { border-color: var(--bad); border-left-color: var(--bad); }
+.vpn-banner strong { display: block; margin-bottom: 4px; font-size: 14px; }
+.vpn-banner p { margin: 4px 0 0; font-size: 13px; line-height: 1.5; }
+.live-embed { margin-top: 16px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--bg); }
+.live-embed[hidden] { display: none; }
+.preset-where { margin-top: 10px; font-size: 11.5px; color: var(--muted); opacity: .8; word-break: break-all; }
+.preset-where code { font-size: 11px; }
+.live-embed { scroll-margin-top: 70px; }
+.live-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; background: var(--card); border-bottom: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+.live-embed iframe { display: block; width: 100%; height: min(78vh, 900px); border: 0; }
+.live-embed.expanded { position: fixed; inset: 0; z-index: 60; margin: 0; border: 0; border-radius: 0; display: flex; flex-direction: column; background: var(--bg); }
+.live-embed.expanded iframe { flex: 1; height: auto; min-height: 0; }
+.manage-dlg { width: min(560px, 100%); }
+.manage-list { list-style: none; margin: 10px 0 0; padding: 0; max-height: 340px; overflow: auto; border: 1.5px solid var(--field-line); border-radius: 10px; }
+.manage-list li { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-top: 1px solid var(--line); font-size: 13.5px; }
+.manage-list li:first-child { border-top: 0; }
+.manage-list .kind { margin-left: auto; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.manage-list input, .check-all input { width: auto; min-height: 0; margin: 0; }
+.check-all { display: flex; align-items: center; gap: 8px; margin: 12px 0 0; font-weight: 600; cursor: pointer; }
+#manage-confirm { align-items: center; }
+#manage-confirm .muted { margin-right: auto; }
+.custom-grid { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; margin: 12px 0 4px; }
+.custom-grid select, .custom-grid input { width: 100%; min-width: 0; }
 .dest-box { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--soft); }
 .dest-head { font-weight: 600; margin-bottom: 8px; }
 .dest-list { list-style: none; padding: 0; margin: 0 0 10px; }
@@ -566,6 +641,14 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 .advanced summary { color: var(--ink); }
 .advanced[open] { padding-bottom: 12px; }
 .dest-main input { font-size: 16px; padding: 10px 12px; }
+.saved-ack { padding: 12px 16px; border-radius: 12px; background: rgba(23,128,61,.12); border: 1px solid rgba(23,128,61,.45);
+             color: var(--ink); font-weight: 600; }
+.saved-ack[hidden] { display: none; }
+.field.from-saved input { border-color: #17803d; background: rgba(23,128,61,.07); outline: none; box-shadow: none; }
+.field.from-saved > label::after { content: "\\2713 from saved"; margin-left: 8px; color: #17803d; font-size: 12px; font-weight: 700; }
+#mon-health, #feed-health { white-space: pre-line; font-size: 13px; }
+.dest-details { margin-top: 18px; border-top: 1px solid var(--line, #e4e6eb); padding-top: 12px; }
+.dest-details summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
 .cmdbox { white-space: pre-wrap; word-break: break-all; background: var(--soft); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 12px; margin: 8px 0; }
 </style></head>
 <body>
@@ -582,6 +665,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
   <button class="btn primary" type="submit" form="cfg" id="start">Start monitoring</button>
   <button class="btn" id="help-btn" type="button" aria-label="How this tool works" aria-expanded="false" aria-controls="pane-help">?</button>
   <button class="btn" id="theme" type="button" aria-label="Toggle light and dark theme">Theme</button>
+  <a class="btn" href="/history" title="Saved runs, with graphs, search, export and delete">History</a>
   <button class="btn" id="quit" type="button" title="Stop srtdebug. It also stops by itself a few minutes after this window is closed.">Quit</button>
 </div></header>
 
@@ -608,14 +692,14 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       <li>On the <strong>Decode stream</strong> tab choose <strong>Listener</strong> to wait for a sender, or
         <strong>Caller</strong> to connect to a remote listener. Enter the port and the latency.</li>
       <li>Press <strong>Start monitoring</strong>. The button becomes <strong>Stop monitoring</strong>, and
-        <strong>Open live dashboard</strong> opens the live view in a new browser tab.</li>
+        <strong>Show live dashboard</strong> shows the live view on this page. Full screen expands it, and Escape closes it.</li>
       <li>A stream ID or passphrase is optional. The passphrase is used for this run only and is not stored.</li>
     </ul>
     <h3>2. Read the status</h3>
     <ul>
       <li><strong>Healthy</strong>: no warnings or errors in the last 5 seconds. Earlier problems stay listed.</li>
       <li><strong>Degraded</strong>: at least one warning in the last 5 seconds. Click the badge to see the issues.</li>
-      <li><strong>Failing</strong>: at least one error in the last 5 seconds.</li>
+      <li><strong>Needs attention</strong>: at least one error in the last 5 seconds.</li>
       <li>The strip shows one cell per 5 seconds, coloured by the worst state in it. Grey means no data.</li>
     </ul>
     <h3>3. What is measured</h3>
@@ -671,10 +755,10 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     <div class="card status" aria-live="polite">
       <div class="status-top">
         <div class="state-row"><span class="led" id="dot"></span>
-          <div><div class="state" id="state">Checking...</div><div class="muted" id="detail"></div></div></div>
+          <div><div class="state" id="state">Checking...</div><div class="muted" id="detail"></div><div class="muted" id="mon-health"></div></div></div>
         <div class="actions">
-          <button class="btn" id="view" type="button">Open live dashboard</button>
-          <a class="btn" id="report" href="/report?download=1" download="srtdebug-report.html" hidden>HTML report</a>
+          <button class="btn" id="view" type="button" aria-expanded="false" aria-controls="live-embed">Show live dashboard</button>
+          <a class="btn" id="report" href="/report?download=1" download hidden>HTML report</a>
           <a class="btn" id="report-pdf" href="/report.pdf" hidden>PDF report</a>
           <a class="btn" id="report-csv" href="/report.csv" download hidden>CSV samples</a>
           <a class="btn" id="report-zip" href="/reports.zip" hidden>All reports (zip)</a>
@@ -683,6 +767,11 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       </div>
       <div class="facts" id="facts"></div>
       <details id="logwrap" hidden><summary>Monitor log</summary><pre id="log"></pre></details>
+      <div id="live-embed" class="live-embed" hidden>
+        <div class="live-bar"><span>Live dashboard</span>
+          <button class="btn" id="live-expand" type="button" aria-expanded="false">Full screen</button></div>
+        <iframe id="live-frame" title="Live dashboard" src="about:blank"></iframe>
+      </div>
     </div>
 
     <div class="card dest-box" id="presets">
@@ -698,12 +787,14 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
         <button class="btn" id="preset-new" type="button">New</button>
       </div>
       <div class="hint" id="preset-msg">Set the connection below, give it a name and press Save to keep it for next time.</div>
+      <div class="preset-where">Saved in <code>__SETTINGS_PATH__</code></div>
     </div>
 
     <div class="subtabs" role="tablist" aria-label="Decode stream sections">
       <button type="button" role="tab" id="sub-conn" aria-selected="true" aria-controls="cfg">Connection</button>
       <button type="button" role="tab" id="sub-thr" aria-selected="false" aria-controls="thr">Health thresholds</button>
     </div>
+    <div class="vpn-banner" id="decode-vpn" role="alert" hidden></div>
     <form class="card" id="cfg" novalidate>
       <div class="group">
         <h2>Connection</h2>
@@ -754,7 +845,10 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
         </div>
       </div>
       <div class="foot">
-        <span class="muted">Press <strong>Start monitoring</strong> at the top to begin. It changes to Stop while running.</span>
+        <span class="muted">Press <strong>Start monitoring</strong> to begin. It changes to Stop while running.</span>
+        <div class="actions tight">
+          <button class="btn primary" id="start-foot" type="submit" form="cfg">Start monitoring</button>
+        </div>
         <div class="err" id="err" role="alert"></div>
       </div>
     </form>
@@ -784,6 +878,12 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
           <div class="feed-phase" id="feed-phase">Not sending</div>
           <p class="feed-detail" id="feed-status" aria-live="polite">Set where the feed goes below, then press Start feed.</p>
           <p class="feed-detail" id="feed-stats"></p>
+          <p class="feed-detail" id="feed-health"></p>
+  <div id="live-box" hidden>
+    <p class="feed-detail" id="live-head"></p>
+    <svg id="live-chart" viewBox="0 0 800 160" preserveAspectRatio="xMidYMid meet" style="width:100%;height:160px;display:block"></svg>
+    <p class="feed-detail"><span style="color:#1d6fb8">&#9632; round trip (ms)</span> &nbsp; <span style="color:#b42318">&#9632; dropped packets (running total)</span> &nbsp; <span>Saved to the History page when the feed stops.</span></p>
+  </div>
           <p class="feed-detail" id="feed-peer" hidden></p>
           <p class="feed-detail" id="feed-wifi" hidden></p>
           <div class="feed-alerts" id="feed-alerts" role="alert" hidden></div>
@@ -794,12 +894,17 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
           <p class="feed-detail" id="feed-counts"></p>
           <ol class="feed-events-list" id="feed-events"></ol>
         </div>
+        <div class="steps-row">
         <div class="subtabs steps" role="tablist" aria-label="Encode stream steps">
           <button type="button" role="tab" id="step-btn-1" data-go="1" aria-selected="true" aria-controls="feedcard">1 Where it goes</button>
           <button type="button" role="tab" id="step-btn-2" data-go="2" aria-selected="false" aria-controls="feedcard">2 Send</button>
         </div>
+        <button class="btn primary step-next-top" type="button" data-go="2">Next: Send &rarr;</button>
+        </div>
+        <div class="vpn-banner" id="feed-vpn" role="alert" hidden></div>
         <div class="feed-step" data-step="1">
         <div class="fields">
+          <div class="field full saved-ack" id="saved-ack" role="status" hidden></div>
           <div class="field full dest-box">
             <div class="dest-head">Saved destinations <span class="muted small">(name, address and options; not the passphrase)</span></div>
             <div class="dest-save">
@@ -828,14 +933,19 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
             <input id="feed-passphrase" type="password" autocomplete="off" maxlength="80">
             <div class="hint">10-80 characters. Not stored.</div></div>
         </div>
-        <div class="step-nav"><span></span><button class="btn primary" type="button" data-go="2">Next</button></div>
+        <div class="step-nav"><span></span><button class="btn primary" type="button" data-go="2">Next: Send &rarr;</button></div>
         </div>
         <div class="feed-step" data-step="2" hidden>
         <div class="dest-summary" id="dest-summary" role="status"></div>
         <div class="fields">
-          <div class="field full"><label for="feed-clip">Sample clip</label>
+          <div class="field full"><label for="feed-clip">Clip to send</label>
+            <div class="subtabs clip-kind" id="clip-kind" role="tablist" aria-label="Which clips to choose from">
+              <button type="button" role="tab" data-kind="sample" aria-selected="true">Sample clips</button>
+              <button type="button" role="tab" data-kind="custom" aria-selected="false">Custom clips</button>
+            </div>
             <select id="feed-clip"></select>
-            <div class="hint" id="feed-cliphint"></div></div>
+            <div class="hint" id="feed-cliphint"></div>
+            <div class="clip-make"><button class="btn" id="feed-make" type="button" title="Writes a set of test clips, one per video format, into a folder you choose. These are the sample clips.">Make sample clips</button> <button class="btn" id="feed-custom" type="button" title="Create one new custom test clip with the codec, resolution, frame rate, audio codec and channels you choose.">Create new custom clip</button> <button class="btn" id="feed-manage" type="button" title="Tick one or more clips and delete them. Works for sample and custom clips.">Manage clips&hellip;</button> <button class="btn" id="feed-folder" type="button" title="Use another folder for the clips. Nothing is moved or made; the clips already there are listed.">Clips folder&hellip;</button></div></div>
           <div class="field full drop" id="feed-drop"><label for="feed-source">Your own video (optional)</label>
             <input id="feed-source" placeholder="Drop a video file here, or type its path">
             <div class="hint" id="feed-drop-msg">H.264, H.265 or MPEG-2 in MP4, MOV, MKV or TS.</div></div>
@@ -875,7 +985,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
         </div>
         <div class="actions tight">
           <button class="btn" id="feed-check" type="button">Check format</button>
-          <button class="btn" id="feed-make" type="button" title="Writes a set of test clips, one per video format, into a folder you choose. Then pick one in Sample clip to send.">Make sample clips</button>
         </div>
         <pre id="feed-format" class="format-box" hidden></pre>
         <div class="checks"><label class="check"><input id="feed-loop" type="checkbox" checked>
@@ -926,14 +1035,52 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
             <div class="actions"><button class="btn" type="button" id="samples-cancel">Cancel</button><button class="btn primary" type="button" id="samples-go">Make clips</button></div>
           </div>
         </div>
-        <div class="dlg-back" id="stopped-back" hidden>
-          <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="stopped-title">
-            <h3 id="stopped-title">Encode stream stopped</h3>
-            <p class="muted small">The log stays in the panel and in Download until the next feed starts. Download it now if you want to keep a copy.</p>
-            <div class="actions">
-              <a class="btn" href="/feed/log" download="srtdebug-feed.log" id="stopped-download">Download log</a>
-              <button class="btn primary" type="button" id="stopped-done">Done</button>
+        <div class="dlg-back" id="manage-back" hidden>
+          <div class="dlg manage-dlg" role="dialog" aria-modal="true" aria-labelledby="manage-title">
+            <h3 id="manage-title">Manage clips</h3>
+            <p class="muted small">Tick the clips to delete. Deleted files are removed from <span id="manage-dir"></span>. This cannot be undone.</p>
+            <label class="check-all"><input type="checkbox" id="manage-all"><span>Select all</span></label>
+            <ul class="manage-list" id="manage-list"></ul>
+            <div class="err" id="manage-err" role="alert"></div>
+            <div class="actions" id="manage-actions"><button class="btn" type="button" id="manage-close">Close</button><button class="btn primary" type="button" id="manage-ask" disabled>Delete selected</button></div>
+            <div class="actions" id="manage-confirm" hidden><span class="muted small" id="manage-confirm-text"></span><button class="btn" type="button" id="manage-keep">Back</button><button class="btn primary" type="button" id="manage-go">Delete</button></div>
+          </div>
+        </div>
+        <div class="dlg-back" id="folder-back" hidden>
+          <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="folder-title">
+            <h3 id="folder-title">Clips folder</h3>
+            <p class="muted small">The panel lists the clips in this folder and makes new ones here. Clips already in the folder are listed; nothing is moved or made.</p>
+            <label class="small muted" for="folder-dir">Folder</label>
+            <div class="row"><input id="folder-dir" type="text" spellcheck="false"><button class="btn" type="button" id="folder-browse">Browse&hellip;</button></div>
+            <div class="err" id="folder-err" role="alert"></div>
+            <div class="actions"><button class="btn" type="button" id="folder-cancel">Cancel</button><button class="btn primary" type="button" id="folder-go">Use this folder</button></div>
+          </div>
+        </div>
+        <div class="dlg-back" id="custom-back" hidden>
+          <div class="dlg custom-dlg" role="dialog" aria-modal="true" aria-labelledby="custom-title">
+            <h3 id="custom-title">Create new custom clip</h3>
+            <p class="muted small">Pick the source options to test. The clip is written to the folder above and appears in Sample clip. Its name keeps your choices so you can tell clips apart.</p>
+            <div class="custom-grid">
+              <label class="small muted" for="custom-codec">Video codec</label>
+              <select id="custom-codec"><option value="h264">H.264</option><option value="hevc">HEVC (H.265)</option><option value="mpeg2">MPEG-2</option></select>
+              <label class="small muted" for="custom-size">Resolution</label>
+              <select id="custom-size"></select>
+              <label class="small muted" for="custom-rate">Frame rate</label>
+              <select id="custom-rate"><option value="23.976">23.976</option><option value="25" selected>25</option><option value="29.97">29.97</option><option value="50">50</option><option value="59.94">59.94</option></select>
+              <label class="small muted" for="custom-audio">Audio codec</label>
+              <select id="custom-audio"><option value="aac" selected>AAC</option><option value="mp2">MP2</option><option value="ac3">AC-3</option><option value="eac3">E-AC-3</option></select>
+              <label class="small muted" for="custom-layout">Channels per track</label>
+              <select id="custom-layout"><option value="mono">Mono (1)</option><option value="stereo" selected>Stereo (2)</option><option value="quad">Quad (4)</option><option value="5.1">5.1 (6)</option></select>
+              <label class="small muted" for="custom-tracks">Audio tracks</label>
+              <select id="custom-tracks"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select>
+              <label class="small muted" for="custom-seconds">Length (seconds)</label>
+              <input id="custom-seconds" type="number" min="5" max="300" step="1" value="15">
+              <label class="small muted" for="custom-name">Name (optional)</label>
+              <input id="custom-name" type="text" maxlength="60" spellcheck="false" placeholder="for example hevc-51ch">
             </div>
+            <p class="muted small" id="custom-note">Each track carries its own tone, one pitch per channel, so you can check which channel comes out where.</p>
+            <div class="err" id="custom-err" role="alert"></div>
+            <div class="actions"><button class="btn" type="button" id="custom-cancel">Cancel</button><button class="btn primary" type="button" id="custom-go">Make clip</button></div>
           </div>
         </div>
         <div class="err" id="feed-err" role="alert"></div>
@@ -949,9 +1096,10 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       <h2 id="feed-done-title">Encode stopped</h2>
       <button type="button" class="btn sm" id="feed-done-close">Close (Esc)</button>
     </div>
-    <p class="muted">Download the log of this feed if you need it, or close to go back to the start.</p>
+    <p class="muted">Download the report of this feed: what was sent, the results, the diagrams and the assumptions.
+      It is also kept with this run in History. Close to go back to the start.</p>
     <div class="done-actions">
-      <a class="btn primary" id="feed-done-log" href="/feed/log" download="srtdebug-feed.log">Feed log (text)</a>
+      <a class="btn primary" id="feed-done-report" href="#" hidden>Download report (PDF)</a>
     </div>
   </div>
 </div>
@@ -963,10 +1111,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     </div>
     <p class="muted" id="done-status">Preparing your reports…</p>
     <div class="done-actions">
-      <a class="btn primary" id="done-zip" href="/reports.zip" hidden>All reports (zip)</a>
-      <a class="btn" id="done-html" href="/report?download=1" download="srtdebug-report.html" hidden>HTML report</a>
-      <a class="btn" id="done-pdf" href="/report.pdf" hidden>PDF report</a>
-      <a class="btn" id="done-csv" href="/report.csv" download hidden>CSV samples</a>
+      <a class="btn primary" id="done-report" href="#" hidden>Download report (PDF)</a>
     </div>
   </div>
 </div>
@@ -981,6 +1126,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     var b = $('start'), feed = window.paneMode === 'feed';
     // the start screen has its own two buttons, so the header button is not shown there
     b.hidden = window.paneMode === 'home';
+    var foot = $('start-foot');
     if (window.paneMode === 'home') { return; }
     if (feed) {
       var fr = !!window.feedRunning;
@@ -991,10 +1137,20 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       b.type = 'submit'; b.setAttribute('form', 'cfg');
       b.textContent = window.srtRunning ? 'Stop monitoring' : 'Start monitoring';
       b.classList.toggle('danger', !!window.srtRunning);
+      if (foot) {
+        foot.textContent = b.textContent;
+        foot.classList.toggle('danger', !!window.srtRunning);
+      }
     }
   }
   window.syncTop = syncTop;
   // 'home' is the start screen with the two buttons; 'control' is Decode, 'feed' is Encode
+  // deep links from the History page: /#decode and /#encode open that pane
+  window.addEventListener('load', function () {
+    if (location.hash === '#encode') { showPane('feed'); }
+    else if (location.hash === '#decode') { showPane('control'); }
+    else if (location.hash === '#help') { showPane('control'); $('help-btn').click(); }
+  });
   function showPane(name) {
     window.paneMode = name === 'feed' || name === 'control' ? name : 'home';
     $('pane-home').hidden = window.paneMode !== 'home';
@@ -1028,17 +1184,73 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       var el = document.getElementById(id);
       if (el) { el.closest('.field').classList.toggle('empty', !el.value.trim()); }
     });
+    // the Decode port and remote host turn green once they are in a valid form
+    var port = $('port'), host = $('host');
+    port.closest('.field').classList.toggle('valid', validPort(port.value.trim()));
+    host.closest('.field').classList.toggle('valid', !$('hostfield').hidden && validHost(host.value.trim()));
+  }
+  function validPort(v) { return /^\\d+$/.test(v) && Number(v) >= 1 && Number(v) <= 65535; }
+  function validHost(v) {
+    var ipv4 = /^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/.exec(v);
+    if (ipv4) { return ipv4.slice(1).every(function (o) { return Number(o) <= 255; }); }
+    return /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/.test(v);
   }
   document.addEventListener('input', syncRequired);
   document.addEventListener('change', syncRequired);
   syncRequired();
   $('tab-feed').addEventListener('click', function () { showPane('feed'); });
-  $('view').addEventListener('click', function () { window.open('/view', '_blank'); });
+  // the live dashboard sits on this page; it loads only while shown, and goes when hidden
+  function liveTheme() { return root.getAttribute('data-theme') === 'light' ? 'light' : 'dark'; }
+  // the embedded dashboard follows the panel's theme: sent on load and whenever the panel changes
+  function liveSync() {
+    try { var w = $('live-frame').contentWindow; if (w) { w.postMessage({ srtTheme: liveTheme() }, '*'); } } catch (e) {}
+  }
+  // the dashboard opens at its tab bar; its own header may sit above the frame's top edge.
+  // Scroll so the tabs sit just below that header, leaving the cards below them in view.
+  function liveToTabs() {
+    try {
+      var w = $('live-frame').contentWindow, d = w.document;
+      var nav = d.querySelector('nav.tabs'), top = d.querySelector('.top');
+      var gap = (top ? top.offsetHeight : 44) + 8;
+      w.scrollTo(0, nav ? Math.max(0, nav.offsetTop - gap) : 0);
+    } catch (e) {}
+  }
+  function liveExpand(on) {
+    var box = $('live-embed'), btn = $('live-expand');
+    box.classList.toggle('expanded', on);
+    btn.textContent = on ? 'Exit full screen' : 'Full screen';
+    btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+    document.body.style.overflow = on ? 'hidden' : '';
+    // full screen starts at the very top of the dashboard, header included
+    if (on) { try { $('live-frame').contentWindow.scrollTo(0, 0); } catch (e) {} box.scrollIntoView({ block: 'start' }); }
+  }
+  function liveShow(on) {
+    var box = $('live-embed'), frame = $('live-frame'), btn = $('view');
+    if (!on) { liveExpand(false); }
+    box.hidden = !on;
+    btn.textContent = on ? 'Hide live dashboard' : 'Show live dashboard';
+    btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+    frame.src = on ? '/view?theme=' + liveTheme() : 'about:blank';
+    // open with the dashboard's top bar and tabs in view, below the panel's sticky header
+    if (on) { box.scrollIntoView({ block: 'start' }); }
+  }
+  $('view').addEventListener('click', function () { liveShow($('live-embed').hidden); });
+  $('live-frame').addEventListener('load', function () {
+    liveSync();
+    liveToTabs();
+  });
+  $('live-expand').addEventListener('click', function () {
+    liveExpand(!$('live-embed').classList.contains('expanded'));
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && $('live-embed').classList.contains('expanded')) { liveExpand(false); }
+  });
 
   $('theme').addEventListener('click', function () {
     var t = root.getAttribute('data-theme');
     var dark = t === 'dark';
     root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    liveSync();
   });
 
   var mode = $('mode');
@@ -1059,6 +1271,49 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
       .then(function (x) { return x.ok ? x.j.rows : null; }).catch(function () { return null; });
   }
+  // A VPN carrying this PC's traffic is flagged on Decode and on Encode, before Start, and stays until it is gone.
+  function vpnNotice(box, mode, port, host) {
+    if (!box) { return; }
+    var q = '/preflight?mode=' + encodeURIComponent(mode) + '&port=' + encodeURIComponent(port || '0') +
+      (host ? '&host=' + encodeURIComponent(host) : '');
+    fetch(q, {cache: 'no-store'}).then(function (r) { return r.json(); }).then(function (j) {
+      var row = (j.rows || []).filter(function (r) { return r.name === 'VPN' && (r.level === 'WARN' || r.level === 'FAIL'); })[0];
+      box.innerHTML = '';
+      box.hidden = !row;
+      if (!row) { return; }
+      box.className = 'vpn-banner' + (row.level === 'FAIL' ? ' fail' : '');
+      var head = document.createElement('strong');
+      head.textContent = row.level === 'FAIL' ? 'This PC is on a VPN, and the VPN will likely stop this stream' : 'This PC is on a VPN';
+      var detail = document.createElement('p');
+      detail.textContent = row.detail;
+      box.appendChild(head);
+      box.appendChild(detail);
+      if (row.fix) {
+        var fix = document.createElement('p');
+        fix.textContent = 'What to do: ' + row.fix;
+        box.appendChild(fix);
+      }
+    }).catch(function () { box.hidden = true; });
+  }
+  function decodeVpn() {
+    var caller = mode.value === 'caller';
+    vpnNotice($('decode-vpn'), caller ? 'caller' : 'listener', $('port').value.trim(), caller ? $('host').value.trim() : '');
+  }
+  function encodeVpn() {
+    var m = $('feed-url').value.trim().match(/^srt:\\/\\/([^:\\/?]+)(?::(\\d+))?/);
+    var caller = m ? true : $('feed-mode').value === 'caller';
+    var host = m ? m[1] : ($('feed-host').value || '').trim();
+    var port = m && m[2] ? m[2] : $('feed-port').value.trim();
+    vpnNotice($('feed-vpn'), caller ? 'caller' : 'listener', port, caller ? host : '');
+  }
+  var vpnTimer = null;
+  function scheduleVpn() {
+    clearTimeout(vpnTimer);
+    vpnTimer = setTimeout(function () { decodeVpn(); encodeVpn(); }, 500);
+  }
+  document.addEventListener('input', scheduleVpn);
+  document.addEventListener('change', scheduleVpn);
+  scheduleVpn();
   // a short notice on the live dashboard when this PC needs attention; dismissed until the issues change
   function rowsHtml(rows) {
     return rows.map(function (r) {
@@ -1142,6 +1397,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
 
   function render(s) {
     var on = s.running;
+    $('mon-health').textContent = on ? window.healthText(s.health) : '';
     if (!window.monSeen) { window.monSeen = true; if (on) { showPane('control'); } }
     // a launch while this window is open asks it to come forward
     if (window.focusSeen === undefined) { window.focusSeen = s.focus_request; }
@@ -1160,7 +1416,9 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     if (on) {
       var c = s.config;
       var where = c.mode === 'caller' ? 'Calling ' + c.host + ':' + c.port : 'Listening on UDP ' + c.port;
-      $('state').textContent = where;
+      // once the stream's data has been analysed, the other side has connected: say so
+      var flowing = !!(s.health && (s.health.streams || []).length);
+      $('state').textContent = flowing ? (c.mode === 'caller' ? 'Connected to ' + c.host + ':' + c.port : 'Connected: receiving on UDP ' + c.port) : where;
       var left = s.ends_in_s;
       $('detail').textContent = 'Running for ' + Math.floor(s.uptime_s / 60) + ' min ' + (s.uptime_s % 60) + ' s'
         + (left != null ? ' · scheduled to end in ' + Math.floor(left / 60) + ' min ' + (left % 60) + ' s' : '');
@@ -1188,10 +1446,11 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     }
     $('stop').disabled = !on;
     $('view').hidden = !on;
+    if (!on) { liveShow(false); }
     window.srtRunning = on;
     syncTop();
     // a run that has just ended: offer the reports once (not on page load)
-    if (!on && window.wasOn) { openDone(); }
+    if (!on && window.wasOn && s.run_id) { openDone(s.run_id); }
     window.wasOn = on;
     if (!$('done-layer').hidden) { doneRender(s); }
     $('report').hidden = !s.report;
@@ -1203,23 +1462,41 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
   }
 
   function doneRender(s) {
-    var ready = !!s.report;
+    var ready = !!(s.run_id || window.doneRunId);
     $('done-title').textContent = s.auto_stopped ? 'Scheduled test complete' : 'Monitoring stopped';
     var waited = Date.now() - (window.doneSince || Date.now());
     if (ready) {
-      $('done-status').textContent = 'Your reports are ready. Download them now, or press Esc to skip.';
-    } else if (!s.csv && waited > 8000) {
-      $('done-status').textContent = 'No data was received during this run, so there are no reports. '
-        + 'The log is in the status panel.';
+      $('done-status').textContent = 'Your report is ready: what was streamed, the results, the diagrams and the '
+        + 'assumptions. It is also kept with this run in History. Press Esc to skip.';
     } else {
-      $('done-status').textContent = 'Preparing your reports… they will appear here. Press Esc to skip.';
+      $('done-status').textContent = 'Preparing your report… Press Esc to skip.';
     }
-    $('done-zip').hidden = !ready;
-    $('done-html').hidden = !ready;
-    $('done-pdf').hidden = !ready;
-    $('done-csv').hidden = !s.csv;
+    $('done-report').hidden = !ready;
   }
-  function openDone() {
+  // the offer is made once per run: a run already offered does not reopen this dialog
+  function offeredOnce(rid) {
+    var key = 'srtdebug.reportOffered.' + rid;
+    try {
+      if (localStorage.getItem(key)) { return true; }
+      localStorage.setItem(key, '1');
+    } catch (err) {
+      try {
+        if (sessionStorage.getItem(key)) { return true; }
+        sessionStorage.setItem(key, '1');
+      } catch (err2) { /* storage blocked: the offer may show again, which is harmless */ }
+    }
+    return false;
+  }
+  function reportHref(rid) {
+    return '/history/customer?format=pdf&id=' + encodeURIComponent(rid);
+  }
+  window.offeredOnce = offeredOnce;
+  window.reportHref = reportHref;
+  function openDone(rid) {
+    if (offeredOnce(rid)) { return; }
+    window.doneRunId = rid;
+    $('done-report').href = reportHref(rid);
+    $('done-report').setAttribute('download', '');
     window.doneSince = Date.now();
     window.reportsSaved = false;
     $('done-layer').hidden = false;
@@ -1248,15 +1525,24 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     $('err').textContent = '';
     var body = {mode: mode.value, port: $('port').value, host: $('host').value,
                 latency: $('latency').value, streamid: $('streamid').value, payload: $('payload').checked, view: $('vid').checked,
-                passphrase: $('passphrase').value, pbkeylen: $('pbkeylen').value, duration: $('duration').value};
-    var pre = mode.value === 'listener' ? fetchPreflight('listener')
-      : ($('host').value ? fetchPreflight('caller', $('host').value) : Promise.resolve(null));
+                passphrase: $('passphrase').value, pbkeylen: $('pbkeylen').value, duration: $('duration').value,
+                preset: mPreset};
+    var pre = window.softLimitGate().then(function (go) {
+      if (!go) { return 'blocked'; }
+      return mode.value === 'listener' ? fetchPreflight('listener')
+        : ($('host').value ? fetchPreflight('caller', $('host').value) : Promise.resolve(null));
+    });
     pre.then(function (rows) {
+      if (rows === 'blocked') { return; }
       return fetch('/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
         .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
         .then(function (x) {
           if (!x.ok) { $('err').textContent = x.j.error || 'Could not start.'; }
-          else { $('passphrase').value = ''; showNotice(rows, mode.value); }
+          else {
+            $('passphrase').value = '';
+            showNotice(rows, mode.value);
+            $('state').closest('.card').scrollIntoView({behavior: 'smooth', block: 'start'});
+          }
           refresh();
         });
     });
@@ -1275,14 +1561,51 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     });
   });
   // while a monitor runs, the header button stops it instead of submitting the form
-  $('start').addEventListener('click', function (e) {
+  // at the soft limit of saved runs, ask before a new run starts. Runs are never blocked: OK starts it
+  // and it is still saved; Cancel opens History so runs can be moved, exported or deleted first.
+  window.softLimitGate = function () {
+    return fetch('/history/list').then(function (r) { return r.json(); }).then(function (d) {
+      var lim = d.limit || {};
+      if (lim.state !== 'limit') { return true; }
+      if (window.confirm(lim.message + '\\n\\nOK: start the run anyway. It will still be saved.\\n' +
+                         'Cancel: open History to move, export or delete runs first.')) { return true; }
+      window.location.href = '/history';
+      return false;
+    }).catch(function () { return true; });
+  };
+
+  // one line of stream health for the screens: the verdict, the check counts, and the codecs
+  window.healthText = function (h) {
+    if (!h) { return ''; }
+    var c = h.counts || {};
+    var streams = (h.streams || []).filter(function (x) { return x.details && x.details.length; });
+    function pick(st, label) {
+      if (!st) { return ''; }
+      var d = st.details.filter(function (p) { return p[0] === label; })[0];
+      return d ? d[1] : '';
+    }
+    var v = streams.filter(function (x) { return x.role.indexOf('Video') === 0; })[0];
+    var a = streams.filter(function (x) { return x.role.indexOf('Audio') === 0; })[0];
+    var out = 'Stream ' + String(h.overall || '').toUpperCase() + ': ' + (c['pass'] || 0) + ' pass, ' +
+      (c['warn'] || 0) + ' warn, ' + (c['fail'] || 0) + ' fail';
+    var vtxt = [pick(v, 'Codec'), pick(v, 'Resolution'), pick(v, 'Frame rate')].filter(Boolean).join(' · ');
+    var atxt = [pick(a, 'Codec'), pick(a, 'Channels'), pick(a, 'Sample rate')].filter(Boolean).join(' · ');
+    if (vtxt) { out += '\\nVideo: ' + vtxt; }
+    if (atxt) { out += '\\nAudio: ' + atxt; }
+    return out;
+  };
+
+  // the header button and the button under the form do the same job
+  function startClick(e) {
     if (window.paneMode === 'feed') {
       e.preventDefault();
       $(window.feedRunning ? 'feed-stop' : 'feed-start').click();
       return;
     }
     if (window.srtRunning) { e.preventDefault(); $('stop').click(); }
-  });
+  }
+  $('start').addEventListener('click', startClick);
+  $('start-foot').addEventListener('click', startClick);
 
   var thrSpec = [];
   function thrFill(values) {
@@ -1443,10 +1766,74 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
   }
   window.updateSendStrip = updateSendStrip;
   $('send-go').addEventListener('click', function () { if (window.showPane) { window.showPane('feed'); } });
+  function drawLive(series, running) {
+    var box = $('live-box'), svg = $('live-chart');
+    box.hidden = !running && !series.length;
+    if (box.hidden) return;
+    $('live-head').textContent = series.length
+      ? 'Live: the last ' + series.length + ' readings (about one a second), round trip and dropped packets.'
+      : 'The live graph starts once the feed connects.';
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    if (!series.length) return;
+    var NS = 'http://www.w3.org/2000/svg', W = 800, H = 160, P = 26;
+    function el(name, attrs) { var e = document.createElementNS(NS, name); for (var k in attrs) e.setAttribute(k, attrs[k]); svg.appendChild(e); return e; }
+    function num(v) { return v === null || v === undefined || isNaN(v) ? null : Number(v); }
+    var rtts = series.map(function (p) { return num(p.rtt_ms); }).filter(function (v) { return v !== null; });
+    var drops = series.map(function (p) { return num(p.dropped); }).filter(function (v) { return v !== null; });
+    var maxR = Math.max(1, Math.max.apply(null, rtts.concat([0])));
+    var maxD = Math.max(1, Math.max.apply(null, drops.concat([0])));
+    function x(i) { return series.length === 1 ? P : P + i * (W - 2 * P) / (series.length - 1); }
+    function yR(v) { return H - P - v / maxR * (H - 2 * P); }
+    function yD(v) { return H - P - v / maxD * (H - 2 * P); }
+    function line(vals, y, color) {
+      var pts = [];
+      vals.forEach(function (v, i) { if (v !== null) pts.push(x(i).toFixed(1) + ',' + y(v).toFixed(1)); });
+      if (pts.length) el('polyline', { points: pts.join(' '), fill: 'none', stroke: color, 'stroke-width': 2 });
+    }
+    function label(text, lx, ly, anchor) {
+      var t = el('text', { x: lx, y: ly, 'font-size': 11, fill: 'currentColor', 'text-anchor': anchor });
+      t.textContent = text;
+    }
+    line(series.map(function (p) { return num(p.rtt_ms); }), yR, '#1d6fb8');
+    line(series.map(function (p) { return num(p.dropped); }), yD, '#b42318');
+    label(maxR.toFixed(1) + ' ms', 4, P - 6, 'start');
+    label('0', 4, H - P + 4, 'start');
+    label(maxD + ' dropped', W - 4, P + 14, 'end');
+    label(series[0].t, P, H - 6, 'start');
+    label(series[series.length - 1].t, W - P, H - 6, 'end');
+  }
+
+  // Sample clips and custom clips are told apart by their file name: custom clips start with "custom-".
+  function clipKindOf(name) { return name.indexOf('custom-') === 0 ? 'custom' : 'sample'; }
+  function renderClips(s) {
+    var all = s.clips || [], labels = s.clip_labels || {};
+    if (!window.clipKind) { window.clipKind = all.some(function (c) { return clipKindOf(c) === 'sample'; }) ? 'sample' : 'custom'; }
+    var kind = window.clipKind;
+    var shown = all.filter(function (c) { return clipKindOf(c) === kind; });
+    var sel = $('feed-clip'), cur = sel.value;
+    sel.innerHTML = '';
+    shown.forEach(function (c) {
+      var o = document.createElement('option'); o.value = c; o.textContent = labels[c] || c; sel.appendChild(o);
+    });
+    if (shown.indexOf(cur) >= 0) { sel.value = cur; }
+    $('feed-cliphint').textContent = shown.length ? '' : (kind === 'custom'
+      ? 'No custom clips yet. Press Create new custom clip to make one.'
+      : 'No sample clips yet. Press Make sample clips.');
+    Array.prototype.forEach.call(document.querySelectorAll('#clip-kind button'), function (b) {
+      b.setAttribute('aria-selected', b.dataset.kind === kind ? 'true' : 'false');
+    });
+    $('feed-manage').disabled = !!s.running;
+    $('feed-folder').disabled = !!s.running;
+  }
   function render(s) {
     var feedNow = !!s.running;
     // the feed has just stopped (by the user or on its own): offer its log, then go back to the start screen
-    if (window.feedWasOn && !feedNow) { openFeedDone(); }
+    if (window.feedWasOn && !feedNow && s.run_id && window.feedStartedHere) {
+      window.feedStartedHere = false;
+      openFeedDone(s.run_id);
+    }
+    // a feed that has just stopped goes back to step 1, so the next one starts from Where it goes
+    if (window.feedWasOn && !feedNow) { showFeedStep(1); }
     window.feedWasOn = feedNow;
     if (!window.feedSeen) { window.feedSeen = true; if (feedNow && window.showPane) { window.showPane('feed'); } }
     window.feedRunning = feedNow;
@@ -1456,17 +1843,10 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     if (window.syncTop) { window.syncTop(); }
     if (s.destinations) { renderDestinations(s.destinations); }
     $('feed-dir').textContent = s.samples_dir;
-    var sel = $('feed-clip'), cur = sel.value;
-    sel.innerHTML = '';
-    var labels = s.clip_labels || {};
-    (s.clips || []).forEach(function (c) {
-      var o = document.createElement('option'); o.value = c; o.textContent = labels[c] || c; sel.appendChild(o);
-    });
-    if (cur) sel.value = cur;
-    $('feed-cliphint').textContent = (s.clips || []).length ? '' : 'No clips yet. Press Make sample clips.';
+    renderClips(s);
     var mk = (s.make || {}).state;
     $('feed-make').disabled = mk === 'making';
-    var haveClips = (s.clips || []).length > 0;
+    var haveClips = (s.clips || []).some(function (c) { return clipKindOf(c) === 'sample'; });
     $('feed-make').dataset.have = haveClips ? '1' : '';
     $('feed-make').textContent = mk === 'making' ? 'Making clips...' : haveClips ? 'Regenerate sample clips' : 'Make sample clips';
     $('feed-make').title = haveClips
@@ -1477,8 +1857,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     $('feed-start').disabled = !!s.running;
     $('feed-stop').disabled = !s.running;
     $('feed-clearview').disabled = !!s.running || !(s.log_tail || []).length;
-    if (window.feedWasRunning && !s.running) { stoppedDialog(); }
-    window.feedWasRunning = !!s.running;
     if (s.rate_max) {
       $('feed-rate').placeholder = s.rate_max;
       $('feed-rate-hint').textContent = 'Leave it empty to use ' + s.rate_max + ' Mb/s. Above ' + s.rate_max + ' you will be asked to confirm.';
@@ -1514,6 +1892,8 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     var avms = stt && s.running ? stt.av_ms : null;
     $('feed-stats').textContent = avms == null ? '' : 'A/V offset on the way out: ' + (avms > 0 ? '+' : '') +
       Math.round(avms) + ' ms (' + (avms > 1 ? 'audio leads' : avms < -1 ? 'audio lags' : 'in step') + ')';
+    $('feed-health').textContent = window.healthText(s.health);
+    drawLive(s.live || [], s.running);
     var al = $('feed-alerts'), alerts = (stt && s.running && stt.alerts) || [];
     al.innerHTML = '';
     al.hidden = !alerts.length;
@@ -1603,13 +1983,6 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     window.logStick = false;
     $('feed-loginfo').textContent = s.log_lines !== undefined ? (s.log_lines || 0) + ' log lines' : '';
   }
-  function stoppedDialog() { $('stopped-back').hidden = false; }
-  function stoppedDone() { $('stopped-back').hidden = true; showFeedStep(1); }
-  $('stopped-done').addEventListener('click', stoppedDone);
-  $('stopped-back').addEventListener('click', function (e) { if (e.target === this) { stoppedDone(); } });
-  document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && !$('stopped-back').hidden) { stoppedDone(); }
-  });
   function nearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 40; }
   function refresh() {
     fetch('/feed/status').then(function (r) { return r.json(); }).then(render).catch(function () {});
@@ -1619,6 +1992,8 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     if (window.updateDestSummary) { window.updateDestSummary(); }
     document.querySelectorAll('#feedcard .feed-step').forEach(function (el) { el.hidden = el.getAttribute('data-step') !== n; });
     [1, 2].forEach(function (i) { $('step-btn-' + i).setAttribute('aria-selected', String(i) === n ? 'true' : 'false'); });
+    var topNext = document.querySelector('#feedcard .step-next-top');
+    if (topNext) { topNext.style.display = n === '2' ? 'none' : ''; }
   }
   document.querySelectorAll('#feedcard [data-go]').forEach(function (el) {
     el.addEventListener('click', function () { showFeedStep(el.getAttribute('data-go')); });
@@ -1717,6 +2092,12 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     sel.value = destList.some(function (d) { return d.name === activeDest; }) ? activeDest : '';
     var cur = destList.filter(function (x) { return x.name === activeDest; })[0];
     $('dest-state').textContent = cur ? 'In use: ' + destSummary(cur) : '';
+    var ack = $('saved-ack');
+    if (ack) {
+      ack.hidden = !cur;
+      ack.textContent = cur ? '\u2713 Using saved destination "' + cur.name + '": the address, port and options are filled in from it.' : '';
+    }
+    document.querySelectorAll('#feedcard .dest-main').forEach(function (f) { f.classList.toggle('from-saved', !!cur); });
     $('dest-del').disabled = !cur;
     $('dest-save').textContent = activeDest && $('dest-name').value.trim() === activeDest ? 'Update' : 'Save';
   }
@@ -1860,6 +2241,9 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
   });
   // starts the feed. Above this computer's limit the user is asked first, and can still go ahead
   function startFeedRequest(body) {
+    window.softLimitGate().then(function (go) { if (go) { startFeedRequestNow(body); } });
+  }
+  function startFeedRequestNow(body) {
     fetch('/feed/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
       .then(function (r) { return r.json(); })
       .then(function (j) {
@@ -1875,8 +2259,9 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
         } else {
           $('feed-passphrase').value = '';
           window.logStick = true;
+          window.feedStartedHere = true;
           showFeedStep(2);
-          $('feedcard').scrollIntoView({behavior: 'smooth', block: 'start'});
+          $('feed-state').scrollIntoView({behavior: 'smooth', block: 'start'});
         }
         render(j);
       });
@@ -1887,7 +2272,12 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       render(j);
     });
   });
-  function openFeedDone() {
+  function openFeedDone(rid) {
+    if (window.offeredOnce(rid)) { return; }
+    var link = $('feed-done-report');
+    link.href = window.reportHref(rid);
+    link.setAttribute('download', '');
+    link.hidden = false;
     window.feedLogSaved = false;
     $('feed-done-layer').hidden = false;
     $('feed-done-close').focus({preventScroll: true});
@@ -1918,6 +2308,46 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     $('samples-dir').focus();
   }
   $('feed-make').addEventListener('click', samplesOpen);
+  var CUSTOM_SIZES = {'h264': ['640x360', '1280x720', '1920x1080', '3840x2160', '720x480', '720x576'],
+    'hevc': ['640x360', '1280x720', '1920x1080', '3840x2160', '720x480', '720x576'],
+    'mpeg2': ['720x480', '720x576', '1280x720', '1920x1080']};
+  var SIZE_LABEL = {'640x360': '640×360', '720x480': '720×480 (SD)', '720x576': '720×576 (SD, PAL)', '1280x720': '1280×720 (HD)', '1920x1080': '1920×1080 (Full HD)', '3840x2160': '3840×2160 (4K UHD)'};
+  var LAYOUTS = {'aac': ['mono', 'stereo', 'quad', '5.1'], 'mp2': ['mono', 'stereo'], 'ac3': ['mono', 'stereo', '5.1'], 'eac3': ['mono', 'stereo', '5.1']};
+  function fillCustom() {
+    var codec = $('custom-codec').value, size = $('custom-size'), keep = size.value;
+    size.innerHTML = '';
+    CUSTOM_SIZES[codec].forEach(function (v) {
+      var o = document.createElement('option'); o.value = v; o.textContent = SIZE_LABEL[v] || v; size.appendChild(o);
+    });
+    size.value = CUSTOM_SIZES[codec].indexOf(keep) >= 0 ? keep : '1280x720';
+    var audio = $('custom-audio').value, lay = $('custom-layout'), lkeep = lay.value;
+    Array.prototype.forEach.call(lay.options, function (o) { o.disabled = LAYOUTS[audio].indexOf(o.value) < 0; });
+    if (LAYOUTS[audio].indexOf(lkeep) < 0) lay.value = 'stereo';
+  }
+  function customClose() { $('custom-back').hidden = true; }
+  function customOpen() {
+    $('custom-err').textContent = '';
+    fillCustom();
+    $('custom-back').hidden = false;
+    $('custom-codec').focus();
+  }
+  $('feed-custom').addEventListener('click', customOpen);
+  $('custom-codec').addEventListener('change', fillCustom);
+  $('custom-audio').addEventListener('change', fillCustom);
+  $('custom-cancel').addEventListener('click', customClose);
+  $('custom-back').addEventListener('click', function (e) { if (e.target === this) customClose(); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !$('custom-back').hidden) customClose(); });
+  $('custom-go').addEventListener('click', function () {
+    $('custom-err').textContent = '';
+    var body = {codec: $('custom-codec').value, size: $('custom-size').value, rate: $('custom-rate').value,
+      audio: $('custom-audio').value, layout: $('custom-layout').value, tracks: Number($('custom-tracks').value),
+      seconds: Number($('custom-seconds').value), name: $('custom-name').value, dir: $('feed-dir').textContent};
+    fetch('/feed/custom', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+      .then(function (r) { return r.json(); }).then(function (j) {
+        if (!j.ok) { $('custom-err').textContent = j.error || 'Could not make the clip.'; return; }
+        customClose(); render(j);
+      });
+  });
   $('samples-cancel').addEventListener('click', samplesClose);
   $('samples-back').addEventListener('click', function (e) { if (e.target === this) samplesClose(); });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !$('samples-back').hidden) samplesClose(); });
@@ -2005,6 +2435,104 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
       .catch(function () { showFormat([], 'Could not read the clip.'); });
   }
   $('feed-clip').addEventListener('change', clipInfo);
+  Array.prototype.forEach.call(document.querySelectorAll('#clip-kind button'), function (b) {
+    b.addEventListener('click', function () {
+      window.clipKind = this.dataset.kind;
+      if (window.feedState) { renderClips(window.feedState); }
+      clipInfo();
+    });
+  });
+  function manageClose() { $('manage-back').hidden = true; }
+  function manageBoxes() { return Array.prototype.slice.call(document.querySelectorAll('#manage-list .manage-pick')); }
+  function manageChosen() { return manageBoxes().filter(function (b) { return b.checked; }).map(function (b) { return b.value; }); }
+  function manageShowConfirm(on) { $('manage-actions').hidden = on; $('manage-confirm').hidden = !on; }
+  function manageCount() {
+    var n = manageChosen().length, boxes = manageBoxes();
+    $('manage-ask').disabled = n === 0;
+    $('manage-ask').textContent = n ? 'Delete ' + n + (n === 1 ? ' clip' : ' clips') : 'Delete selected';
+    $('manage-all').checked = boxes.length > 0 && n === boxes.length;
+  }
+  function manageRender() {
+    var s = window.feedState || {}, all = s.clips || [];
+    var ul = $('manage-list');
+    ul.innerHTML = '';
+    $('manage-dir').textContent = s.samples_dir || 'the clips folder';
+    all.forEach(function (c) {
+      var li = document.createElement('li'), cb = document.createElement('input'), name = document.createElement('span'), kind = document.createElement('span');
+      cb.type = 'checkbox'; cb.value = c; cb.className = 'manage-pick'; cb.id = 'mp-' + ul.children.length;
+      cb.addEventListener('change', manageCount);
+      name.textContent = c;
+      kind.className = 'kind'; kind.textContent = clipKindOf(c) === 'custom' ? 'Custom' : 'Sample';
+      li.appendChild(cb); li.appendChild(name); li.appendChild(kind); ul.appendChild(li);
+    });
+    if (!all.length) { ul.innerHTML = '<li class="muted">No clips in this folder yet.</li>'; }
+    $('manage-all').disabled = !all.length;
+    $('manage-err').textContent = '';
+    manageShowConfirm(false);
+    manageCount();
+  }
+  $('feed-manage').addEventListener('click', function () { manageRender(); $('manage-back').hidden = false; });
+  $('manage-all').addEventListener('change', function () {
+    var on = this.checked;
+    manageBoxes().forEach(function (b) { b.checked = on; });
+    manageCount();
+  });
+  $('manage-close').addEventListener('click', manageClose);
+  $('manage-ask').addEventListener('click', function () {
+    var n = manageChosen().length;
+    if (!n) { return; }
+    $('manage-confirm-text').textContent = 'Delete ' + n + (n === 1 ? ' clip' : ' clips') + '?';
+    manageShowConfirm(true);
+    $('manage-go').focus();
+  });
+  $('manage-keep').addEventListener('click', function () { manageShowConfirm(false); });
+  $('manage-go').addEventListener('click', function () {
+    var names = manageChosen();
+    fetch('/feed/clips/delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({clips: names})})
+      .then(function (r) { return r.json(); }).then(function (j) {
+        if (!j.ok) {
+          $('manage-err').textContent = j.error || 'Could not delete the clips.';
+          manageShowConfirm(false);
+          return;
+        }
+        render(j);
+        manageRender();
+        clipInfo();
+      });
+  });
+  $('manage-back').addEventListener('click', function (e) { if (e.target === this) manageClose(); });
+  function folderClose() { $('folder-back').hidden = true; }
+  $('feed-folder').addEventListener('click', function () {
+    $('folder-dir').value = (window.feedState || {}).samples_dir || '';
+    $('folder-err').textContent = '';
+    $('folder-back').hidden = false;
+    $('folder-dir').focus();
+  });
+  $('folder-cancel').addEventListener('click', folderClose);
+  $('folder-back').addEventListener('click', function (e) { if (e.target === this) folderClose(); });
+  $('folder-browse').addEventListener('click', function () {
+    $('folder-err').textContent = '';
+    fetch('/feed/folder', {method: 'POST'}).then(function (r) { return r.json(); }).then(function (j) {
+      if (j.dir) { $('folder-dir').value = j.dir; }
+      else if (j.error) { $('folder-err').textContent = j.error; }
+    });
+  });
+  $('folder-go').addEventListener('click', function () {
+    $('folder-err').textContent = '';
+    fetch('/feed/clips-folder', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dir: $('folder-dir').value})})
+      .then(function (r) { return r.json(); }).then(function (j) {
+        if (!j.ok) { $('folder-err').textContent = j.error || 'Could not change the folder.'; return; }
+        folderClose();
+        render(j);
+        clipInfo();
+      });
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') { return; }
+    if (!$('manage-back').hidden) { manageClose(); }
+    if (!$('folder-back').hidden) { folderClose(); }
+  });
   $('feed-clock').addEventListener('change', function () {
     if (this.checked) { $('feed-encode').value = 'h264'; }
     syncPrompt();
@@ -2044,7 +2572,7 @@ pre { background: var(--soft); border: 1px solid var(--line); border-radius: 10p
     $('sm-ours').style.width = Math.min(j.cpu, j.ours) + '%';
     $('sm-mem').style.width = j.mem + '%';
     $('sm-cpu-t').textContent = Math.round(j.cpu) + '% (ours ' + Math.round(j.ours) + '%)';
-    $('sm-mem-t').textContent = Math.round(j.mem) + '% (' + j.mem_used_gb + ' of ' + j.mem_total_gb + ' GB)';
+    $('sm-mem-t').textContent = Math.round(j.mem) + '%';
     box.classList.toggle('hot', j.cpu >= 85 || j.mem >= 90);
     var h = j.history || [], n = h.length, c = [], m = [];
     for (var i = 0; i < n; i++) {
@@ -2133,7 +2661,7 @@ def _handler(session):
                 return
             if state["state"] == "ready" and os.path.exists(pdf_path):
                 with open(pdf_path, "rb") as f:
-                    self._send(200, f.read(), "application/pdf", filename="srtdebug-report.pdf")
+                    self._send(200, f.read(), "application/pdf", filename=_report_name(os.path.dirname(pdf_path), "pdf"))
                 return
             # still building: a small page that asks the browser to check again
             self._send(202, '<!doctype html><meta charset="utf-8">'
@@ -2168,9 +2696,11 @@ def _handler(session):
                         z.write(fp, name)
             self._send(200, buf.getvalue(), "application/zip", filename="srtdebug-reports.zip")
 
-        def _proxy(self, path):
+        def _proxy(self, path, inject=None):
             try:
                 body, ctype = session.fetch(path)
+                if inject and "html" in ctype and b"</head>" in body:
+                    body = body.replace(b"</head>", inject.encode("utf-8") + b"</head>", 1)
                 self._send(200, body, ctype)
             except LookupError:
                 self._send(404, "<p>No monitor is running. Start one from the control panel.</p>")
@@ -2180,7 +2710,7 @@ def _handler(session):
         def do_GET(self):
             path = self.path.split("?")[0]
             if path == "/":
-                self._send(200, CONTROL_PAGE)
+                self._send(200, CONTROL_PAGE.replace("__SETTINGS_PATH__", html.escape(SETTINGS_PATH)))
             elif path == "/status":
                 _window_seen()   # the open page asks for this every two seconds
                 self._json(200, session.status())
@@ -2194,6 +2724,13 @@ def _handler(session):
                 snap = METER.snapshot()
                 snap["active"] = bool(_our_pids())   # the meter shows only while the feed or monitor runs
                 self._json(200, snap)
+            elif path.startswith("/history"):
+                hist = history_web.handle_get(path, urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query))
+                if hist is None:
+                    self._send(404, "<p>Not found.</p>")
+                else:
+                    code, ctype, body, fname = hist
+                    self._send(code, body, ctype, filename=fname or None)
             elif path == "/feed/log":
                 # the whole debug log of the last feed, as a text file
                 if not FEEDER.logpath or not os.path.exists(FEEDER.logpath):
@@ -2203,7 +2740,7 @@ def _handler(session):
                         self._send(200, _redact(f.read().decode("utf-8", "replace")).encode("utf-8"),
                                    "text/plain; charset=utf-8", filename="srtdebug-feed.log")
             elif path == "/view":
-                self._proxy("/")
+                self._proxy("/", inject=VIEW_INJECT)
             elif path == "/live":
                 self._proxy("/live")
             elif path.startswith("/video/"):
@@ -2221,7 +2758,7 @@ def _handler(session):
                 if session.dir and os.path.exists(report):
                     with open(report, "rb") as f:
                         download = "download=1" in (self.path.partition("?")[2])
-                        self._send(200, f.read(), filename="srtdebug-report.html" if download else None)
+                        self._send(200, f.read(), filename=_report_name(session.dir, "html") if download else None)
                 else:
                     self._send(404, "<p>No report yet. It is written when the monitor stops.</p>")
             else:
@@ -2237,6 +2774,17 @@ def _handler(session):
                 self._json(200, {"ok": not err, "path": saved, "lines": lines, "error": err, "warn": warn})
                 return
             raw = self.rfile.read(min(length, 10000)) if length else b"{}"
+            if path.startswith("/history/"):
+                try:
+                    hbody = json.loads(raw.decode("utf-8") or "{}")
+                except ValueError:
+                    hbody = {}
+                res = history_web.handle_post(path, hbody if isinstance(hbody, dict) else {})
+                if res is None:
+                    self._send(404, "<p>Not found.</p>")
+                else:
+                    self._json(*res)
+                return
             if path == "/thresholds":
                 try:
                     body = json.loads(raw.decode("utf-8") or "{}")
@@ -2321,6 +2869,44 @@ def _handler(session):
                     return
                 FEEDER.start_making(folder)
                 self._json(200, {"ok": True, "error": "", **FEEDER.status()})
+            elif path == "/feed/custom":
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                except (ValueError, json.JSONDecodeError):
+                    body = {}
+                asked = body.get("dir") if isinstance(body, dict) and "dir" in body else FEEDER.samples_dir
+                folder, err = checked_samples_dir(asked)
+                if err:
+                    self._json(400, {**FEEDER.status(), "ok": False, "error": err})
+                    return
+                try:
+                    spec = _samples_module().custom_spec(body)
+                except ValueError as e:
+                    self._json(400, {**FEEDER.status(), "ok": False, "error": str(e)})
+                    return
+                ok, msg = FEEDER.start_custom(folder, spec)
+                self._json(200 if ok else 400, {**FEEDER.status(), "ok": ok, "error": msg, "file": spec["file"]})
+            elif path == "/feed/clips/delete":
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                except (ValueError, json.JSONDecodeError):
+                    body = {}
+                names = body.get("clips") if isinstance(body, dict) else None
+                if not isinstance(names, list):
+                    names = []
+                ok, msg = FEEDER.delete_clips([str(x) for x in names])
+                self._json(200 if ok else 400, {**FEEDER.status(), "ok": ok, "error": msg})
+            elif path == "/feed/clips-folder":
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                except (ValueError, json.JSONDecodeError):
+                    body = {}
+                folder, err = checked_samples_dir(body.get("dir") if isinstance(body, dict) else "")
+                if err:
+                    self._json(400, {**FEEDER.status(), "ok": False, "error": err})
+                    return
+                ok, msg = FEEDER.set_folder(folder)
+                self._json(200 if ok else 400, {**FEEDER.status(), "ok": ok, "error": msg})
             elif path == "/feed/clearview":
                 ok, msg = FEEDER.clear_view()
                 self._json(200 if ok else 400, {**FEEDER.status(), "ok": ok, "error": msg})
@@ -2499,6 +3085,15 @@ def load_presets():
         if isinstance(item, dict) and str(item.get("name") or "").strip():
             out.append({"name": str(item["name"]), **{k: str(item[k]) for k in MON_PRESET_KEYS if k in item}})
     return out
+
+
+def _report_name(run_dir, ext):
+    """The download name of a run's report, built from its summary. Falls back to the plain name."""
+    try:
+        summary, _ = customer_report.load(run_dir)
+        return customer_report.report_name(summary, ext)
+    except Exception:
+        return "srtdebug-report." + ext
 
 
 def checked_samples_dir(text):
@@ -2680,7 +3275,7 @@ def _plain_events(lines):
     return collapsed[-8:], connects, closes, totals
 
 
-def _forward(src, dst, analyser):
+def _forward(src, dst, analyser, keep=None):
     """Copies the transport stream from ffmpeg to srt-live-transmit and measures it on the way.
     The copy is written first, so measuring never delays the stream. If measuring fails, the copy carries on."""
     measuring = analyser is not None
@@ -2691,6 +3286,8 @@ def _forward(src, dst, analyser):
                 break
             dst.write(chunk)
             dst.flush()
+            if keep is not None:
+                keep(chunk)
             if measuring:
                 try:
                     analyser.feed(chunk)
@@ -2863,7 +3460,7 @@ def feed_command_text(uri, path, loop, level, stats="<stats file>", encode=None)
     src += (["-stream_loop", "-1"] if loop else [])
     src += ["-i", path] + (encode or ["-c", "copy"]) + ["-f", "mpegts"] + FEED_MUX + ["-"]
     # -chunk:1316 sets the media payload per SRT packet: 1316 bytes, seven 188-byte transport-stream packets
-    dst = ["srt-live-transmit", "file://con", uri, "-chunk:1316", "-loglevel:" + level, "-stats-report-frequency:500",
+    dst = ["srt-live-transmit", "file://con", uri, "-chunk:1316", "-loglevel:" + level, "-stats-report-frequency:50",
            "-statsout:" + stats, "-pf:json"]
     return _redact(shlex.join(src) + " | " + shlex.join(dst))
 
@@ -3016,6 +3613,10 @@ class Feeder:
         self.host_port = ""
         self.encrypted = False
         self.statspath = ""
+        self.run = None                   # the saved run for this feed (see runhistory)
+        self.follower = None
+        self._run_stop = None
+        self._run_lock = threading.Lock()
         self._stats_off = 0
         self._stats_last = None
         self._stats_tot = {"bytes": 0, "packets": 0, "lost": 0, "retrans": 0, "dropped": 0, "recv": 0}
@@ -3222,7 +3823,14 @@ class Feeder:
             # the feed ended on its own (not stopped from the panel): say why, in the reader's words
             self.error = "The feed stopped." + (" Last message: " + prog["log_tail"][-1] if prog["log_tail"] else "")
             self.clip = self.target = ""
-        return {"running": prog["running"], "clip": self.clip, "target": self.target, "error": self.error,
+            self._end_run("ended on its own")
+        report = None
+        if prog["running"] and self.ts is not None:
+            try:
+                report = tsanalyze.build_report(self.ts, fields=self.codec_fields)
+            except Exception:
+                report = None
+        return {"health": report, "run_id": getattr(self, "last_run_id", None), "running": prog["running"], "clip": self.clip, "target": self.target, "error": self.error,
                 "notice": self.notice if self.want else "", "restarts": len(self.restarts),
                 "resume_at": _fmt_clock(self.resume_at) if self.resume_at else "", "rate_max": cpu_profile()[2], "rate_note": cpu_note(),
                 "make": dict(self.make), "samples_dir": self.samples_dir, "clips": clips(self.samples_dir),
@@ -3243,7 +3851,8 @@ class Feeder:
                 "wifi_forced": self.wifi_forced if prog["running"] else False,
                 "network_wifi": network_detected(),
                 "encode_label": self.encode_label if prog["running"] else "",
-                "gop": self._gop_text() if prog["running"] else ""}
+                "gop": self._gop_text() if prog["running"] else "",
+                "live": self.follower.live() if self.follower is not None else []}
 
     def start(self, body, keep_log=False, note=None, resuming=False):
         if not resuming:
@@ -3345,6 +3954,8 @@ class Feeder:
                 fd, self.logpath = tempfile.mkstemp(prefix="srtdebug-feed-", suffix=".log")
                 self.log = os.fdopen(fd, "w")
                 self.view_offset = 0
+            if not resuming:
+                self._begin_run(body, uri)
             sfd, self.statspath = tempfile.mkstemp(prefix="srtdebug-feed-stats-", suffix=".json")
             self._stats_off = 0
             self._stats_last = None
@@ -3358,11 +3969,15 @@ class Feeder:
                 self.p1 = subprocess.Popen(src, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 threading.Thread(target=_pump_lines, args=(self.p1.stderr, self.log, "ffmpeg: "), daemon=True).start()
                 self.ts = tsanalyze.TSAnalyzer(start=time.monotonic())
+                self._ring, self._ring_n, self.codec_fields = collections.deque(), 0, {}
+                if not hasattr(self, "_ring_lock"):
+                    self._ring_lock = threading.Lock()
                 self.p2 = subprocess.Popen([shutil_which("srt-live-transmit") or core.SRT_BIN, "file://con", uri,
-                                            "-chunk:1316", "-loglevel:" + level, "-stats-report-frequency:500",
+                                            "-chunk:1316", "-loglevel:" + level, "-stats-report-frequency:50",
                                             "-statsout:" + self.statspath, "-pf:json"],
                                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.log)
-                threading.Thread(target=_forward, args=(self.p1.stdout, self.p2.stdin, self.ts), daemon=True).start()
+                threading.Thread(target=_forward, args=(self.p1.stdout, self.p2.stdin, self.ts, self._keep_bytes),
+                                 daemon=True).start()
             except OSError as e:
                 self.error = f"Could not start the feed: {e}"
                 return False, self.error
@@ -3377,6 +3992,7 @@ class Feeder:
             if not resuming:
                 self.restarts = []
             threading.Thread(target=self._watch, args=(self.gen,), daemon=True).start()
+            threading.Thread(target=self._probe_feed, args=(self.gen,), daemon=True).start()
             if clock_file:
                 threading.Thread(target=_clock_writer, args=(clock_file, self.gen, self), daemon=True).start()
             self.host_port = uri.split("?")[0].replace("srt://", "")
@@ -3415,6 +4031,7 @@ class Feeder:
             self.notice = ""
             self._kill_procs()
             self.clip = self.target = ""
+            self._end_run("stopped by you")
 
     def _av_now(self):
         """Audio-video offset on the way out, in ms (positive: audio leads). Not shown yet: the measurement from
@@ -3427,6 +4044,75 @@ class Feeder:
             return None
         vals = [v for v in (self.ts._av_offset_ms(w) for w in wins) if v is not None]
         return round(statistics.median(vals), 1) if vals else None
+
+    def _begin_run(self, body, uri):
+        """Open a saved run for this feed, and keep its numbers in step with the sender's stats."""
+        self._end_run("replaced by a new feed")
+        settings = {k: v for k, v in body.items() if k != "passphrase"}
+        settings["encrypted"] = bool(body.get("passphrase"))
+        settings["host"] = uri.split("?")[0].replace("srt://", "")
+        rec = runhistory.RunRecorder(root=runhistory.DEFAULT_ROOT)
+        run_dir = rec.open_run("feed", "feed " + settings["host"], settings)
+        self.run = rec
+        self.follower = runhistory.TransmitFollower(run_dir)
+        self._run_stop = threading.Event()
+        stop = self._run_stop
+
+        def follow():
+            while not stop.wait(2):
+                self._poll_run()
+        threading.Thread(target=follow, daemon=True).start()
+
+    def _poll_run(self):
+        with self._run_lock:
+            if self.follower is not None and self.run is not None:
+                try:
+                    self.follower.poll(self.statspath, self.logpath)
+                except Exception:
+                    pass
+
+    def _end_run(self, result):
+        """Finish the saved run. Never lets a history problem stop the feed."""
+        with self._run_lock:
+            rec, follower, stop = self.run, self.follower, self._run_stop
+            self.run = self.follower = self._run_stop = None
+        if rec is None:
+            return
+        if stop is not None:
+            stop.set()
+        try:
+            if follower is not None:
+                follower.poll(self.statspath, self.logpath)
+                follower.close()
+            report = tsanalyze.build_report(self.ts, fields=self.codec_fields) if self.ts is not None else None
+            run_dir = rec.finish(result, report=report)
+            self.last_run_id = os.path.relpath(run_dir, runhistory.DEFAULT_ROOT).replace(os.sep, "/")
+            customer_report.write_html(run_dir)
+        except Exception:
+            pass
+
+    def _keep_bytes(self, chunk):
+        """The newest PROBE_RING_BYTES of the stream, for ffprobe to read the codecs from."""
+        with self._ring_lock:
+            self._ring.append(chunk)
+            self._ring_n += len(chunk)
+            while self._ring_n > PROBE_RING_BYTES and self._ring:
+                self._ring_n -= len(self._ring.popleft())
+
+    def _probe_feed(self, gen):
+        """Reads the codec of each stream from the bytes being sent, so a feed shows what it carries."""
+        time.sleep(6)
+        while self.gen == gen and self.running():
+            with self._ring_lock:
+                snap = b"".join(self._ring)
+            if len(snap) >= 188 * 200:
+                try:
+                    info = tsanalyze.probe_stream(snap)
+                except Exception:
+                    info = None
+                if info:
+                    self.codec_fields = {pid: tsanalyze.stream_fields(s) for pid, s in info.items()}
+            time.sleep(15)
 
     def _kill_procs(self):
         for p in (self.p2, self.p1):
@@ -3517,6 +4203,64 @@ class Feeder:
                 self.notice = ""
                 self.error = msg or "The feed could not be started again."
 
+    def delete_clips(self, names):
+        """Removes clip files from the clips folder. Nothing is removed unless every name is in the folder, and
+        nothing is removed while clips are being made or while the feed is sending one of them."""
+        folder = self.samples_dir
+        names = [os.path.basename(n) for n in names if n]
+        if not names:
+            return False, "Choose at least one clip."
+        known = set(clips(folder))
+        missing = [n for n in names if n not in known]
+        if missing:
+            return False, "Not in the clips folder: " + ", ".join(missing)
+        with self.lock:
+            if self.make["state"] == "making":
+                return False, "Clips are being made. Wait for them to finish, then delete."
+            if self.running() and self.clip_path and os.path.basename(self.clip_path) in names:
+                return False, "The feed is sending one of these clips. Stop the feed before deleting it."
+            failed = []
+            for n in names:
+                try:
+                    os.remove(os.path.join(folder, n))
+                except OSError:
+                    failed.append(n)
+        if failed:
+            return False, "Could not delete: " + ", ".join(failed)
+        return True, ""
+
+    def set_folder(self, folder):
+        """Points the panel at another clips folder. Nothing is made or moved; the clips already there are listed."""
+        with self.lock:
+            if self.make["state"] == "making":
+                return False, "Clips are being made. Wait for them to finish, then change the folder."
+            if self.running():
+                return False, "Stop the feed before changing the clips folder."
+            self.samples_dir = folder
+        save_settings(samples_dir=folder)
+        return True, ""
+
+    def start_custom(self, folder, spec):
+        """Makes one custom clip in the background. Shares the make state, so the Make button waits too."""
+        with self.lock:
+            if self.make["state"] == "making":
+                return False, "Clips are already being made. Wait for them to finish."
+            self.samples_dir = folder
+            self.make = {"state": "making", "error": ""}
+        save_settings(samples_dir=folder)
+
+        def job():
+            samples = _samples_module()
+            try:
+                samples.make_custom(spec, folder, log=lambda m: None)
+                state = {"state": "ready", "error": ""}
+            except Exception as e:
+                state = {"state": "error", "error": str(e)}
+            with self.lock:
+                self.make = state
+        threading.Thread(target=job, daemon=True).start()
+        return True, ""
+
     def start_making(self, folder):
         with self.lock:
             if self.make["state"] == "making":
@@ -3581,6 +4325,12 @@ def _fmt_clock(secs):
     """Seconds as m:ss for the panel and the log."""
     secs = int(secs or 0)
     return "%d:%02d" % (secs // 60, secs % 60)
+
+
+def _samples_module():
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import samples
+    return samples
 
 
 def _rate_text(fps):

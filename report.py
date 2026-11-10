@@ -181,7 +181,10 @@ def summarize(rows, target=None, window=False, run_start=None):
 
 _uid = itertools.count(1)
 RANK = {"ok": 0, "warn": 1, "bad": 2, "down": 3}
-SEVERITY_TEXT = {"PASS": "Healthy", "WARN": "Degraded", "FAIL": "Failing"}
+SEVERITY_TEXT = {"PASS": "Healthy", "WARN": "Degraded", "FAIL": "Needs attention"}
+# the words shown for a check level; FAIL reads as ATTENTION, the same wording as the customer report
+def level_word(level):
+    return {"fail": "ATTENTION", "FAIL": "ATTENTION"}.get(level, str(level).upper())
 NOW_WINDOW_S = 5.0   # the header's current state looks at this much of the newest stream
 ISSUE_HINTS = [
     ("packet loss", "Check the network path and the SRT latency. Loss that the receive buffer cannot recover appears here."),
@@ -1280,7 +1283,7 @@ def config_section(findings, frames=None):
     if findings:
         head = f"{counts['fail']} fail · {counts['warn']} warn · {counts['info']} info"
         rows_html = "".join(
-            f"<tr title=\"{esc(f['why'])}\"><td>{_pill(f['level'].upper(), f['level'])}</td><td>{esc(_pid_text(f['pid']))}</td>"
+            f"<tr title=\"{esc(f['why'])}\"><td>{_pill(level_word(f['level']), f['level'])}</td><td>{esc(_pid_text(f['pid']))}</td>"
             f"<td><b>{esc(f['title'])}</b></td><td>{esc(f['why'])}</td><td>{esc(f['check'])}</td></tr>"
             for f in findings)
         body = ('<div class="panel tablewrap"><table class="cfg"><thead><tr><th>Level</th><th>Stream</th>'
@@ -2184,7 +2187,7 @@ def build_html(rows, meta, checks=None, events=None, payload=None, live=False, v
 
     checks_html = ""
     if checks:
-        lbl = {"ok": ("PASS", "ok"), "warn": ("WARN", "warn"), "fail": ("FAIL", "fail"), "info": ("INFO", "info")}
+        lbl = {"ok": ("PASS", "ok"), "warn": ("WARN", "warn"), "fail": ("ATTENTION", "fail"), "info": ("INFO", "info")}
         body = []
         for lvl, name, detail, fix in checks:
             text, cls = lbl[lvl]
@@ -2242,8 +2245,11 @@ def build_html(rows, meta, checks=None, events=None, payload=None, live=False, v
             note = (f" Live video is adding a lot of load ({share:.0f}% of this PC's CPU). Keep that in mind, and "
                     f"consider running the check without the video: uncheck \"Live video in the dashboard\" on "
                     f"the Decode stream tab.")
+        mem_pc = usage.get("mem_pc_pct")
+        mem_text = (f"{mem_pc:.1f}% of this PC's RAM ({usage['rss_mb']:.0f} MB)" if mem_pc is not None
+                    else f"{usage['rss_mb']:.0f} MB")
         info_rows.append(("This monitor's load",
-                          f"CPU {cpu_text}; memory {usage['rss_mb']:.0f} MB. Counts this monitor and its "
+                          f"CPU {cpu_text}; memory {mem_text}. Counts this monitor and its "
                           f"helpers only ({usage['processes']} processes in all), sampled every 2 s at {usage['time']}."
                           + note))
     info = "".join(f"<dt>{esc(k)}</dt><dd>{esc(val)}</dd>" for k, val in info_rows)
@@ -2262,10 +2268,12 @@ def build_html(rows, meta, checks=None, events=None, payload=None, live=False, v
     usage_charts = ""
     if usage_hist:
         usage_charts = ('<div class="spark-row">'
-                        + _spark([(t, c / max(1, (usage or {}).get("cores", 1)), w) for t, c, _, w in usage_hist],
+                        + _spark([(t, c / max(1, (usage or {}).get("cores", 1)), w) for t, c, _, w, _ in usage_hist],
                                  "CPU of this monitor, % of this PC", "%",
                                  "var(--accent)")
-                        + _spark([(t, m, w) for t, _, m, w in usage_hist], "Memory of this monitor", "MB", "var(--info)")
+                        + (_spark([(t, p, w) for t, _, _, w, p in usage_hist], "Memory of this monitor, % of this PC", "%", "var(--info)")
+                           if all(r[4] is not None for r in usage_hist) else
+                           _spark([(t, m, w) for t, _, m, w, _ in usage_hist], "Memory of this monitor", "MB", "var(--info)"))
                         + '</div>')
     details_html = (f'<section id="details"><div class="ph"><h2>Run details</h2></div>'
                     f'<div class="panel">{usage_charts}<dl class="kv-grid">{info}</dl></div>{thr_html}</section>')

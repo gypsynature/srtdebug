@@ -18,6 +18,34 @@ It works two ways:
 
 Python 3 standard library only. Requires the `srt-tools` package.
 
+## What's new in 3.0
+
+**Stream analysis on every run.** Analysis is on by default. Each run gets a plain-English report of what was streamed and how it measured up.
+
+- **What was streamed:** video codec, resolution, frame rate, scan, chroma subsampling and bit depth; audio codec, sample rate, channels and declared bit rate.
+- **Stream checks:** the ETSI TR 101 290 checks for priorities 1 to 3 (sync, PAT and PMT, continuity, PCR, PTS, CRC, transport errors and more). Each is marked PASS, WARN or ATTENTION. A rare fault on a long run (at or below 6 an hour) is shown as a note under "What needs a look" and does not change the verdict; a stream that keeps faulting still gets WARN or ATTENTION. A failing run's verdict reads NEEDS ATTENTION. Average bitrate, null packets, PCR interval and audio/video offset are reported as well.
+- **Set-up window:** events in the first 15 seconds after a connection are shown as a note and are not counted against the stream.
+- **Not evaluated:** checks the stream does not carry are listed at the bottom, not counted as failures.
+- The analysis covers the SRT stream only. It does not report on the computer's CPU or on srtdebug's own statistics.
+
+**Customer report.** When a run stops, you are offered a one-time download of the full report as a PDF (or HTML). It covers the verdict, what was streamed, the measured results with charts, what needs a look, every check, and the assumptions, written so it can be shared with customers and management. The PDF needs Google Chrome or Chromium.
+
+**Run history.** Every monitor and feed run is saved under `~/.srtdebug/runs`. The History page lists runs by time, with their result and dropped packets.
+
+- Click a run to open it. Click it again to fold it away.
+- Click a row to tick it, or use its box. The box in the header ticks or clears every run in the list.
+- Export, move or delete the ticked runs, or compare one run with another.
+- When the history reaches 50 runs, you are asked before another run starts.
+
+**Control panel.**
+
+- **Start monitoring** also appears at the bottom of the decode screen, as **Start feed** does on the encode screen.
+- **Saved destinations** keep a name, address and options for next time. The passphrase is never saved.
+- The "Where it goes" step has its own Next button beside the step tabs.
+- After a feed starts, the panel scrolls to its connection status. When a feed stops, the panel returns to "Where it goes" for the next one.
+- **Clips.** Sample clips and custom clips are listed separately. **Create new custom clip** makes one clip with the video codec (H.264, HEVC or MPEG-2), resolution, frame rate, audio codec (AAC, MP2, AC-3 or E-AC-3), channels per track (mono, stereo, quad or 5.1) and number of audio tracks (1 to 4) you choose. Each track carries its own tone, one pitch per channel. **Manage clips** deletes one or several clips at once. **Clips folder** points the panel at another folder without making any clips.
+- **Report file names** show the preset used (for a monitor run), the resolution, the frame rate and the start time, for example `srtdebug-Lab-feed-1920x1080-25fps-2026-11-09-1113.pdf`. The same words head the report and label the run in History.
+
 ## Install
 
 Download the latest release from the Releases page of this repository. Pick the file for your computer.
@@ -87,12 +115,14 @@ Use this to receive a stream coming in to this computer, or to connect out to on
    stream in the dashboard (needs ffmpeg; about 8 seconds behind the stream).
    Before you start, the panel also runs a **Before you listen** check of this computer.
 4. **Presets.** Save the current settings under a name and load them again from the drop-down
-   list. Presets are kept on this computer. Passphrases are never saved in a preset.
-5. Press **Start monitoring**. The button becomes **Stop monitoring**, and **Open live dashboard**
-   opens the live view in a new browser tab.
+   list. Presets are kept on this computer, in `~/.srtdebug/settings.json`; the panel shows that path under the presets. Passphrases are never saved in a preset.
+5. Press **Start monitoring**. The button becomes **Stop monitoring**, and the status card scrolls
+   into view. **Show live dashboard** shows the live view on this page, starting at its tabs.
+   **Full screen** expands it to fill the window, with its header at the top. **Exit full screen
+   or press Escape** returns you to the panel, in the same tab.
 
 **Reading the status.** The status is **Healthy** (no warnings or errors in the last 5 seconds),
-**Degraded** (at least one warning in that time) or **Failing** (at least one error). Click the
+**Degraded** (at least one warning in that time) or **Needs attention** (at least one error). Click the
 badge to see the issues. The strip below it has one cell per 5 seconds, coloured by the worst
 state in that time. Grey means no data. Problems stay listed after they clear.
 
@@ -404,6 +434,19 @@ srtdebug evidence recording.ts            # frames and report.html for frozen or
 `evidence` pulls out frames from a recorded MPEG-TS file where the picture looks frozen or
 black, with a report beside them.
 
+### Custom test clips (control panel)
+
+On the Encode stream page, press **Create new custom clip** to make one test clip with the settings you choose:
+
+- **Video codec:** H.264, HEVC (H.265) or MPEG-2. MPEG-2 is offered at 720x480, 720x576, 1280x720 and 1920x1080.
+- **Resolution and frame rate:** 640x360 up to 3840x2160, at 23.976, 25, 29.97, 50 or 59.94 frames per second.
+- **Audio codec:** AAC, MP2, AC-3 or E-AC-3. The panel only offers the channel layouts each codec can carry.
+- **Channels per track:** mono, stereo, quad (4 channels) or 5.1.
+- **Audio tracks:** 1 to 4.
+- **Length:** 5 to 300 seconds.
+
+Each audio channel carries its own tone, at a different pitch, so you can check on the receiver which channel came out where. Custom clips are listed under **Custom clips**, apart from the sample clips. **Manage clips** deletes one or several clips at once, and **Clips folder** points the panel at another folder without making any clips.
+
 ### 9. Dashboard report (`report`)
 
 ```bash
@@ -412,7 +455,7 @@ srtdebug report run.jsonl --out run.pdf        # PDF, rendered with headless Chr
 srtdebug report run.csv --customer "ACME" --target-mbps 8 --redact
 ```
 
-The report has a PASS / WARN / FAIL verdict with the reasons, summary cards,
+The report has a PASS / WARN / NEEDS ATTENTION verdict (each check is marked PASS, WARN or ATTENTION) with the reasons, summary cards,
 health gauges, bitrate and loss charts, the readiness checks and the event log.
 When payload data is present, it also has the stream contents, and the suspected
 causes. `--redact` leaves the host and streamid out of the report, for sharing.

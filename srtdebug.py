@@ -30,7 +30,7 @@ import time
 from collections import deque
 from urllib.parse import quote
 
-VERSION = "2.0"
+VERSION = "3.0"
 # SRT's own default latency is 120 ms. 20 ms is the lowest value that works on a short path:
 # SRT recommends at least 3-4 x RTT, so it only suits links with RTT under about 6 ms.
 DEFAULT_LATENCY_MS = 20
@@ -48,6 +48,15 @@ TTY = sys.stdout.isatty() and "NO_COLOR" not in os.environ
 import thresholds as _thresholds
 import netlink
 import usage as _usage
+import sysmeter
+
+
+def _pc_ram_mb():
+    """Total RAM of this PC in MB, or None where it cannot be read (not Linux)."""
+    try:
+        return sysmeter._mem()[1] * 1024.0
+    except Exception:
+        return None
 _T = _thresholds.load()
 LOSS_WARN_PCT, LOSS_BAD_PCT = _T["loss_warn_pct"], _T["loss_bad_pct"]
 # Loss that was detected and then retransmitted in time is repaired, so it is information, not a
@@ -622,10 +631,14 @@ class Monitor:
             self.usage_last = meter.sample(pids)
             if self.usage_last is not None:
                 self.usage_last["video"] = vproc is not None and vproc.poll() is None
+                total_mb = _pc_ram_mb()
+                self.usage_last["mem_pc_pct"] = (round(self.usage_last["rss_mb"] / total_mb * 100, 2)
+                                                 if total_mb else None)
                 if self.usage_last["cpu_pct"] is not None:
-                    # for the trend charts: seconds since start, CPU % of one core, memory MB (last hour)
+                    # for the trend charts: seconds since start, CPU % of one core, memory MB, memory % of this PC
                     self.usage_hist.append((time.monotonic() - self.start, self.usage_last["cpu_pct"],
-                                            self.usage_last["rss_mb"], time.time()))
+                                            self.usage_last["rss_mb"], time.time(),
+                                            self.usage_last["mem_pc_pct"]))
             time.sleep(2.0)
 
     def _diag_loop(self):
@@ -1052,6 +1065,23 @@ class Monitor:
                     break
                 time.sleep(0.05)
 
+    def write_health(self):
+        """Write the stream report (health checks, streams, analysis CPU) for the control panel's history."""
+        path = getattr(self.a, "health", None)
+        if not path or self.ts is None:
+            return
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import tsanalyze
+        try:
+            tsanalyze.write_report(path, tsanalyze.build_report(self.ts, fields=self.codec_fields))
+        except (OSError, ValueError):
+            pass
+
+    def _health_loop(self):
+        while not self.stopping and self.proc.poll() is None:
+            time.sleep(5)
+            self.write_health()
+
     def shutdown(self):
         self.stopping = True
         if getattr(self, "content_dir", None):
@@ -1195,6 +1225,7 @@ def cmd_report(a):
 
 WAITING_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>srtdebug - waiting</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='5' fill='%230b1220'/><path d='M3 12h4l2-6 4 12 2-6h6' fill='none' stroke='%230a84ff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>">
 <style>body{font:15px/1.5 system-ui,sans-serif;background:#f5f6fa;color:#1c2030;display:flex;
 align-items:center;justify-content:center;min-height:100vh;margin:0}p{text-align:center}</style></head>
 <body><main><p>Waiting for the first samples from the stream...</p></main>
@@ -1458,12 +1489,14 @@ def cmd_monitor(a):
         threading.Thread(target=mon._read_payload, daemon=True).start()
         threading.Thread(target=mon._probe_loop, daemon=True).start()
         threading.Thread(target=mon._content_loop, daemon=True).start()
+        threading.Thread(target=mon._health_loop, daemon=True).start()
     try:
         mon.run()
     except KeyboardInterrupt:
         pass
     finally:
         mon.shutdown()
+        mon.write_health()
         if server:
             server.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1963,6 +1996,7 @@ def main():
     m.add_argument("--payload", action="store_true",
                    help="analyse the MPEG-TS inside: codecs, per-stream bitrate, null packets, "
                         "continuity errors, restarts, and suspected cause")
+    m.add_argument("--health", metavar="FILE", help=argparse.SUPPRESS)  # the control panel's stream report
     report_opts(m)
 
     rp = sub.add_parser("report", help="build an HTML dashboard from an export file")

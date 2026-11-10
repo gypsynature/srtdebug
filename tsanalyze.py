@@ -16,6 +16,7 @@ the evidence it is based on.
 """
 
 import bisect
+import json
 import os
 import re
 import statistics
@@ -924,6 +925,10 @@ def verdict_for(findings, mode=None):
 
 RECENT_S = 30                 # seconds in the rolling rate shown on the dashboard
 CONNECT_WINDOW_S = 15.0      # errors within this many seconds of the first data are reported as connection set-up
+# A priority 1-3 fault seen at or below this many times an hour is a NOTE: it is listed for a look but does
+# not change the verdict. Above it, priority 1 is a FAIL and priority 2-3 a WARN. A long run with a few
+# rare events therefore still passes; a stream that keeps dropping does not.
+NOTE_PER_HOUR = 6.0
 
 # ffprobe's field_order codes, written out in plain words
 FIELD_ORDER_TEXT = {
@@ -1722,3 +1727,130 @@ def keyframe_header_check(snap):
     if vid is None:
         return None
     return count_keyframe_headers(_video_es(snap, vid))
+
+
+# ------------------------------------------------------------------ stream health and report
+
+# Lip-sync limits (ITU-R BT.1359): audio may lead video by up to 45 ms and lag by up to 125 ms.
+AV_LEAD_MAX_MS = 45.0
+AV_LAG_MAX_MS = 125.0
+PCR_REPEAT_LIMIT_MS = PCR_REPEAT_MAX_S * 1000.0
+
+
+def _check(group, name, status, value, note=""):
+    return {"group": group, "name": name, "status": status, "value": value, "note": note}
+
+
+def _duration(ts, now=None):
+    now = time.monotonic() if now is None else now
+    if ts.first_data is None:
+        return 0.0
+    return max(0.0, now - ts.first_data)
+
+
+def _hours_text(hours):
+    minutes = hours * 60
+    if minutes < 90:
+        return f"{minutes:.0f} min"
+    return f"{hours:.1f} h"
+
+
+def health_checks(ts, now=None):
+    """Pass, warn or fail for each check. TR 101 290 priority 1 errors fail the stream; priority 2 and 3
+    warn. Checks this tool cannot measure are listed as 'not measured', never as a pass."""
+    out = []
+    dur = _duration(ts, now)
+    hours = max(dur, 60.0) / 3600.0          # at least one minute, so a very short run does not divide by nothing
+    for item in ts.tr101290():
+        pr = item["priority"]
+        group = f"TR 101 290 priority {pr}"
+        name, note = item["name"], item["hint"]
+        if item["count"] is None:
+            out.append(_check(group, name, "not measured", "not measured", note))
+            continue
+        if item.get("carried") is False:
+            out.append(_check(group, name, "info", "not carried by this stream", note))
+            continue
+        # the status counts only episodes after the connection has settled (CONNECT_WINDOW_S). Joining a stream
+        # always shows a few, such as the first PCR interval, so they are reported as a note, not a warning.
+        early = item.get("early", 0)
+        late = item.get("late", item["count"] - early)
+        set_up = f" ({early} during connection set-up, not counted)" if early else ""
+        if late == 0:
+            out.append(_check(group, name, "pass", "none after set-up" + set_up, note))
+            continue
+        rate = late / hours
+        value = f"{late} after set-up over {_hours_text(hours)} ({rate:.1f} per hour)" + set_up
+        if rate <= NOTE_PER_HOUR:
+            out.append(_check(group, name, "note", value, note + " Rare for this run length: listed for a look, "
+                              "does not change the verdict."))
+        else:
+            out.append(_check(group, name, "fail" if pr == 1 else "warn", value, note))
+
+    if ts.bytes_total and dur:
+        out.append(_check("Stream", "Average bitrate", "info",
+                          f"{ts.bytes_total * 8 / dur / 1e6:.2f} Mb/s", "all PIDs, averaged over the run"))
+    if ts.bytes_total:
+        null_pct = 100.0 * ts.pid_total.get(NULL_PID, 0) / ts.bytes_total
+        out.append(_check("Stream", "Null packets", "info", f"{null_pct:.1f}%",
+                          "share of the bytes that are null padding"))
+    pcr = [s for s in ts.pcr_interval_stats() if s["count"] and s["max_ms"] is not None]
+    if pcr:
+        worst = max(s["max_ms"] for s in pcr)
+        mean = statistics.mean(s["mean_ms"] for s in pcr if s["mean_ms"] is not None)
+        out.append(_check("Stream", "PCR interval", "pass" if worst <= PCR_REPEAT_LIMIT_MS else "warn",
+                          f"mean {mean:.1f} ms, longest {worst:.1f} ms",
+                          "TR 101 290 asks for a PCR at least every 40 ms"))
+    avs = [v for v in (ts._av_offset_ms(w) for w in list(ts.windows)[-60:]) if v is not None]
+    if avs:
+        med = statistics.median(avs)
+        ok = -AV_LAG_MAX_MS <= med <= AV_LEAD_MAX_MS
+        out.append(_check("Stream", "Audio/video offset", "pass" if ok else "warn", f"{med:+.0f} ms",
+                          "estimate from the timestamps; positive means audio leads"))
+    return out
+
+
+def stream_report(ts, fields=None):
+    """Every PID this run: role, codec details in plain words, average rate and share."""
+    fields = fields or {}
+    out = []
+    for r in ts.pid_table():
+        details = [[label, value] for label, value in fields.get(r["pid"], [])]
+        out.append({"pid": r["pid"], "role": r["role"], "program": r["program"],
+                    "desc": r["desc"], "kbps": r["kbps_run"], "share": r["share"],
+                    "stuffing_pct": r["stuffing_pct"], "details": details})
+    return out
+
+
+def build_report(ts, fields=None, now=None):
+    """The stream report for one run: health checks and the streams in it."""
+    now = time.monotonic() if now is None else now
+    checks = health_checks(ts, now)
+    counts = {k: sum(1 for c in checks if c["status"] == k)
+              for k in ("pass", "note", "warn", "fail", "info", "not measured")}
+    overall = "fail" if counts["fail"] else "warn" if counts["warn"] else "pass"
+    return {
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "overall": overall,
+        "counts": counts,
+        "checks": checks,
+        "streams": stream_report(ts, fields),
+        "service": dict(ts.sdt) if ts.sdt else None,
+        "duration_s": round(_duration(ts, now), 1),
+    }
+
+
+def write_report(path, report):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_report(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
